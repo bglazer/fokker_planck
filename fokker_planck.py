@@ -159,7 +159,7 @@ for i in range(epochs):
     # This is the p(x) term that I derived from the Fokker-Planck equation
     ppx = (pxt(x, t=0) - pxt(x, t=1) - ux(x) * pxt.Sdx_dt(x)) / (ux.dx(x))
     # Train it to match the data p_D(x) 
-    l_px = ((ppx - px)**2).mean() #+ ((pxt(X0, t=0) - pD0)**2).mean()
+    l_px = ((ppx - px)**2).mean() 
     l_px.backward()
 
     l_fp = torch.zeros(1, device=device, requires_grad=True)
