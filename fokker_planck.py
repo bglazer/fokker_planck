@@ -73,6 +73,8 @@ class Pxt(torch.nn.Module):
     def p(self, x, t):
         # Convert scalar t to a tensor of the same shape as x, for input to the model
         t_ = torch.ones(x.shape, device=self.device)*t
+        # I use exp(model) instead of model output directly because 
+        # I want to ensure that p(x,t) is always positive
         return torch.exp(self.model(torch.hstack((x, t_))))
 
     # Compute the probability density p(x,t) using the neural network
