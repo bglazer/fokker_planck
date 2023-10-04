@@ -70,13 +70,10 @@ class Pxt(torch.nn.Module):
         self.model = MLP(2, 1, hidden_dim, n_layers).to(device)
         self.device = device
 
-    # Convert scalar t to a tensor of the same shape as x, for input to the model
-    def t_(self, t, shape):
-        return torch.ones(shape, device=self.device)*t
-    
     def p(self, x, t):
-        t = self.t_(t, x.shape)
-        return torch.exp(self.model(torch.hstack((x, t))))
+        # Convert scalar t to a tensor of the same shape as x, for input to the model
+        t_ = torch.ones(x.shape, device=self.device)*t
+        return torch.exp(self.model(torch.hstack((x, t_))))
 
     # Compute the probability density p(x,t) using the neural network
     def forward(self, x, t):
