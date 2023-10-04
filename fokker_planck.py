@@ -118,7 +118,6 @@ X1 = torch.vstack((X0, X1))
 _=plt.hist(X0.cpu().numpy(), bins=30, alpha=.3)
 _=plt.hist(X1.cpu().numpy(), bins=30, alpha=.3)
 #%%
-#%%
 epochs = 500
 steps = 1
 hx = 1e-3
@@ -129,12 +128,19 @@ pD = gen_p(X1.cpu().numpy(), bins=100)
 # Initialize the neural networks
 pxt = Pxt(20, 3, device)
 ux = Ux(20, 3, device)
+# Initialize the optimizers
 pxt_optimizer = torch.optim.Adam(pxt.parameters(), lr=1e-4)
+# I've found that a faster learning rate for the drift term works fine
 ux_optimizer = torch.optim.Adam(ux.parameters(), lr=1e-3)
-pD0 = torch.tensor(pD.pdf(X0.cpu().numpy()), device=device, dtype=torch.float32, requires_grad=False)
 
 ts = torch.linspace(0, 1, 100, device=device, requires_grad=False)
-# %%
+## %%
+# NOTE: This is a pre-training step to get p(x, t=0) to match the initial distribution
+# I didn't have this when the code was working earlier, so this feels like a hack
+# It also really messes up the training of the p(x) term right now, so I've commented it out
+# It might be useful to have this in the future when the training is working better
+
+# pD0 = torch.tensor(pD.pdf(X0.cpu().numpy()), device=device, dtype=torch.float32, requires_grad=False)
 # pxt0_optimizer = torch.optim.Adam(pxt.parameters(), lr=1e-3)
 # for i in range(epochs):
 #     pxt0_optimizer.zero_grad()
@@ -150,22 +156,32 @@ for i in range(epochs):
     x = pD.rvs(size=(1000,1))
     px = torch.tensor(pD.pdf(x), device=device, dtype=torch.float32, requires_grad=False)
     x = torch.tensor(x, device=device, dtype=torch.float32, requires_grad=False)
+    # This is the p(x) term that I derived from the Fokker-Planck equation
     ppx = (pxt(x, t=0) - pxt(x, t=1) - ux(x) * pxt.Sdx_dt(x)) / (ux.dx(x))
-    
+    # Train it to match the data p_D(x) 
     l_px = ((ppx - px)**2).mean() #+ ((pxt(X0, t=0) - pD0)**2).mean()
     l_px.backward()
-    torch.nn.utils.clip_grad_norm_(pxt.parameters(), .001)
-    pxt_optimizer.step()
 
     l_fp = torch.zeros(1, device=device, requires_grad=True)
+    
+    # This is the term that ensures the derivatives match the Fokker-Planck equation
+    # up is just the product of u(x) and p(x,t)
     up = lambda x, t: ux(x) * pxt(x, t)
     for t in ts:
+        # This is: d/dx (u(x) * p(x,t))
         up_dx = -(up(x+hx,t) - up(x-hx,t))/(2*hx)
+        # This loss should enforce: d/dt p(x,t) == -d/dx (u(x) * p(x,t))
         l_fp_t = (pxt.dt(x, t) - up_dx)**2
         l_fp = l_fp + l_fp_t.mean()
     l_fp = l_fp / len(ts)
     l_fp.backward()
 
+    # Training is very unstable, so I found that aggressively clipping the magnitude 
+    # of the gradients helps stabilize the training
+    # NOTE: We're optimizing both the p(x) and u(x) terms at the same time.
+    # I've tried training them separately, and I can't tell which is better.
+    torch.nn.utils.clip_grad_norm_(pxt.parameters(), .001)
+    pxt_optimizer.step()
     torch.nn.utils.clip_grad_norm_(ux.parameters(), .001)
     ux_optimizer.step()
 
@@ -180,6 +196,7 @@ for i in range(epochs):
     # print('---')
 
 #%%
+# Plot the predicted p(x) versus the data p_D(x)
 xs = torch.arange(X1.min(), X1.max(), .01, device=device)[:,None]
 ppxs = (pxt(xs, t=0) - pxt(xs, t=1) - ux(xs) * pxt.Sdx_dt(xs)) / (ux.dx(xs))
 px = torch.tensor(pD.pdf(xs.detach().cpu().numpy()), device=device, dtype=torch.float32, requires_grad=False)
@@ -188,30 +205,23 @@ plt.plot(xs.detach().cpu().numpy(), px.cpu().numpy(), label='Data')
 plt.legend()
 
 # %%
+# Plot the predicted p(x,t) at each timestep t
+# NOTE: This plot is typically really weird, like the p(x,t) is completely wrong, it doesn't
+# look like the data at all. I'm not sure why this is, but it's probably some mistake in 
+# either my math or the code. I'm not sure how to debug this though.
 colors = matplotlib.colormaps.get_cmap('viridis')
 xs = torch.arange(X1.min(), X1.max(), .01, device=device)[:,None]
 for t in torch.linspace(0, 1, 100, device=device):
     # print(t)
     pxst = pxt(xs, t)
     plt.plot(xs.cpu().numpy(), pxst.cpu().detach().numpy(), c=colors(float(t)))
-    # plt.plot(xs.cpu().numpy(), pD.pdf(xs.cpu().numpy()), c='k', alpha=1)
-# plt.colorbar()
-#%%
-ts = torch.linspace(0, 1, 100, device=device)
-ppx = torch.zeros_like(xs)
-for t in ts:
-    pxst = pxt(xs, t)
-    ppx = ppx + pxst/len(ts)
-plt.plot(xs.cpu().numpy(), ppx.cpu().detach().numpy())
+# Plot the data distribution
 plt.plot(xs.cpu().numpy(), pD.pdf(xs.cpu().numpy()), c='k', alpha=1)
-    
-#%%
-# Plot the cdf of the data and the final distribution
-# plt.plot(X1.cpu().numpy(), px_cdf.cpu().numpy(), label='Data CDF')
-# ppx_cdf = ppx.clip(0).cumsum(dim=0)/ppx.clip(0).sum()
-# plt.plot(X1.cpu().numpy(), ppx_cdf.detach().cpu().numpy(), label='Model CDF')
-# plt.legend()
+# plt.colorbar()
+
 # %%
+# This plots the cumulative mean of p(x,t) at each timestep t, going from t=0 (left) to t=1 (right)
+# Higher probability is shown in yellow, lower probability is shown in blue
 xs = torch.arange(X1.min(), X1.max(), .1, device=device)[:,None]
 ts = torch.linspace(0, 1, 100, device=device)
 pxst = torch.zeros(xs.shape[0], ts.shape[0], device=device)
@@ -224,6 +234,7 @@ plt.imshow(cum_pxst.cpu().detach().numpy(), aspect='auto', interpolation='none',
 plt.colorbar()
 
 #%%
+# This is the individual p(x,t) at each timestep t, going from t=0 (left) to t=1 (right)
 plt.imshow(pxst.cpu().detach().numpy(), aspect='auto', interpolation='none', cmap='viridis')
 plt.colorbar()
 
@@ -231,5 +242,6 @@ plt.colorbar()
 # for x in xs:
 #     print(float(ux(x)))
 # %%
+# Plot the u(x) term for all x
 plt.plot(xs.cpu().detach().numpy(), ux(xs).cpu().detach().numpy())
 # %%
