@@ -157,7 +157,7 @@ for epoch in range(epochs):
     # This is the marginal p(x) = int p(x,t) dt
     Spxt = pxt(x, ts).sum(dim=0) * ht
     # Ensure that the marginal p(x) matches the data distribution
-    l_Spxt = ((Spxt - px)**2).mean()
+    l_Spxt = ((Spxt[:,0] - px)**2).mean()
     l_Spxt.backward()
 
     # This is the calculation of the term that ensures the
