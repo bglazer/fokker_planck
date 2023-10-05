@@ -142,7 +142,7 @@ ht = ts[1] - ts[0]
 l_fps = np.zeros(epochs)
 l_Spxts = np.zeros(epochs)
 l_p0s = np.zeros(epochs)
-for epoch in range(1000):
+for epoch in range(epochs):
     # Sample from the data distribution
     x = pD.rvs(size=1000)
     px = torch.tensor(pD.pdf(x), device=device, dtype=torch.float32, requires_grad=False)
@@ -177,9 +177,12 @@ for epoch in range(1000):
     l_Spxts[epoch] = float(l_Spxt.mean())
     l_p0s[epoch] = float(l_p0.mean())   
 #%%
+plt.title('Loss curves')
 plt.plot(l_fps[10:], label='l_fp')
 plt.plot(l_Spxts[10:], label='l_Spxt')
 plt.plot(l_p0s[10:], label='l_p0')
+plt.xlabel('Epoch')
+plt.ylabel('Loss')
 plt.legend()
 
 # %%
@@ -187,37 +190,52 @@ plt.legend()
 colors = matplotlib.colormaps.get_cmap('viridis')
 xs = torch.arange(X1.min(), X1.max(), .01, device=device)[:,None]
 
-
-pxst = pxt(xs, ts).squeeze().T.cpu().detach().numpy()
+pxts = pxt(xs, ts).squeeze().T.cpu().detach().numpy()
 uxs = ux(xs).squeeze().cpu().detach().numpy()
 xs = xs.squeeze().cpu().detach().numpy()
+
+plt.title('p(x,t)')
 plt.plot(xs, pD.pdf(xs), c='k', alpha=1)
 plt.plot(xs, pD0.pdf(xs), c='k', alpha=1)
 for i in range(0, ts.shape[0], 10):
     t = ts[i]
-    plt.plot(xs, pxst[:,i], c=colors(float(t)))
-# Plot the data distribution
-# plt.colorbar()
+    plt.plot(xs, pxts[:,i], c=colors(float(t)))
+plt.xlabel('x')
+plt.ylabel('p(x,t)')
+# Add a colorbar to show the timestep
+sm = plt.cm.ScalarMappable(cmap=colors, norm=plt.Normalize(vmin=0, vmax=1))
+sm.set_array([])
+plt.colorbar(sm, label='timestep - t')
 
 # %%
 # This plots the cumulative mean of p(x,t) at each timestep t, going from t=0 (left) to t=1 (right)
 # Higher probability is shown in yellow, lower probability is shown in blue
-cum_pxst = pxst.cumsum(axis=1) / np.arange(1, ts.shape[0]+1)
-plt.imshow(cum_pxst, aspect='auto', interpolation='none', cmap='viridis')
+plt.title('Cumulative mean of p(x,t)')
+cum_pxt = pxts.cumsum(axis=1) / np.arange(1, ts.shape[0]+1)
+plt.imshow(cum_pxt, aspect='auto', interpolation='none', cmap='viridis')
+plt.ylabel('x')
+plt.xlabel('timestep - t')
 plt.colorbar()
 # %%
 # This plots the error of the cumulative mean of p(x,t) at each timestep t, going from t=0 (left) to t=1 (right)
 pxs = pD.pdf(xs)
-plt.imshow(pxs[:,None] - cum_pxst, aspect='auto', interpolation='none', cmap='RdBu')
+plt.title('Error of cumulative mean of p(x,t)')
+plt.imshow(pxs[:,None] - cum_pxt, aspect='auto', interpolation='none', cmap='RdBu')
+plt.ylabel('x')
+plt.xlabel('timestep - t')
 plt.colorbar()
 
 #%%
 # This is the individual p(x,t) at each timestep t, going from t=0 (left) to t=1 (right)
-plt.imshow(pxst, aspect='auto', interpolation='none', cmap='viridis')
+plt.title('p(x,t) at each timestep t')
+plt.imshow(pxts, aspect='auto', interpolation='none', cmap='viridis')
+plt.ylabel('x')
+plt.xlabel('timestep - t')
 plt.colorbar()
 # %%
 # Plot the u(x) term for all x
 fig, ax1 = plt.subplots(1,1, figsize=(10,5))
+plt.title('u(x) vs p(x)')
 ax1.plot(xs, uxs, label='u(x)')
 # Add vertical and horizontal grid lines
 ax1.grid()
