@@ -140,7 +140,7 @@ ht = ts[1] - ts[0]
 
 l_Spxts = np.zeros(epochs)
 l_p0s = np.zeros(epochs)
-l_pxt_dts = np.zeros(epochs)
+l_fps = np.zeros(epochs)
 for epoch in range(epochs):
     # Sample from the data distribution
     x = pD.rvs(size=1000)
@@ -148,6 +148,8 @@ for epoch in range(epochs):
     x = torch.tensor(x, device=device, dtype=torch.float32, requires_grad=False)[:,None]
 
     pxt_optimizer.zero_grad()
+    ux_optimizer.zero_grad()
+
     # This is the initial condition p(x, t=0)=p_D0 
     l_p0 = ((pxt(x0, ts=zero) - pX_D0)**2).mean()
     l_p0.backward()
@@ -158,53 +160,30 @@ for epoch in range(epochs):
     l_Spxt = ((Spxt[:,0] - px)**2).mean()
     l_Spxt.backward()
 
-    # Smoothness of d/dt p(x,t), this might help train u(x,t)
-    # Second derivative measures smoothness
-    alpha = 0
-    l_pxt_dt = (((pxt.dt(x+hx, ts) - pxt.dt(x-hx, ts))/(2*hx))**2).mean()
-    l_pxt_dt = l_pxt_dt*alpha
-    l_pxt_dt.backward()
-
     # Record the losses
     l_Spxts[epoch] = float(l_Spxt.mean())
     l_p0s[epoch] = float(l_p0.mean())   
-    l_pxt_dts[epoch] = float(l_pxt_dt)
-    # Take a gradient step
-    pxt_optimizer.step()
-    print(f'{epoch} l_px={float(l_Spxt.mean()):.5f}, l_p0={float(l_p0.mean()):.5f}, l_pxt_dt={float(l_pxt_dt.mean()):.5f}')
-#%%
-low = X1.min()
-high = X1.max()
-w = high - low
-x = torch.linspace(low-.25*w, high+.25*w, 1000, device=device, dtype=torch.float32, requires_grad=False)[:,None]
 
-fp_epochs = epochs*5
-l_fps = np.zeros(fp_epochs)
-for epoch in range(fp_epochs):
-    ux_optimizer.zero_grad()
     # This is the calculation of the term that ensures the
     # derivatives match the Fokker-Planck equation
     # d/dx p(x,t) = -d/dt (u(x) p(x,t))
-    up_dx = (ux(x+hx) * pxt(x+hx, ts).detach() - ux(x-hx) * pxt(x-hx, ts).detach())/(2*hx)
-    pxt_dts = pxt.dt(x, ts).detach()
+    up_dx = (ux(x+hx) * pxt(x+hx, ts) - ux(x-hx) * pxt(x-hx, ts))/(2*hx)
+    pxt_dts = pxt.dt(x, ts)
     l_fp = ((pxt_dts + up_dx)**2).mean()
 
     l_fp.backward()
     
-    # Regularize the magnitude of u(x)
-    l_ux = (ux(x)**2).mean()*0
-    l_ux.backward()
-
+    # Take a gradient step
+    pxt_optimizer.step()
     ux_optimizer.step()
-    print(f'{epoch} l_fp={float(l_fp.mean()):.5f}, l_ux={float(l_ux):.5f}')
+    print(f'{epoch} l_px={float(l_Spxt.mean()):.5f}, l_p0={float(l_p0.mean()):.5f}, '
+          f'l_fp={float(l_fp.mean()):.5f}')
     l_fps[epoch] = float(l_fp.mean())
 
 
 #%%
 plt.title('Loss curves')
 plt.plot(l_fps[10:], label='l_fp')
-#%%
-plt.title('Loss curves')
 plt.plot(l_Spxts[10:], label='l_Spxt')
 plt.plot(l_p0s[10:], label='l_p0')
 plt.xlabel('Epoch')
@@ -212,7 +191,6 @@ plt.ylabel('Loss')
 plt.legend()
 
 # %%
-# Plot the predicted p(x,t) at each timestep t
 viridis = matplotlib.colormaps.get_cmap('viridis')
 greys = matplotlib.colormaps.get_cmap('Greys')
 purples = matplotlib.colormaps.get_cmap('Purples')
@@ -231,6 +209,7 @@ pxt_dts = pxt_dts.detach().cpu().numpy()[:,:,0]
 
 xs = xs.squeeze().cpu().detach().numpy()
 #%%
+# Plot the predicted p(x,t) at each timestep t
 plt.title('p(x,t)')
 plt.plot(xs, pD.pdf(xs), c='k', alpha=1)
 plt.plot(xs, pD0.pdf(xs), c='k', alpha=1)
@@ -246,7 +225,6 @@ plt.colorbar(sm, label='timestep (t)')
 
 #%%
 # Plot the Fokker Planck terms
-
 for i in range(0,len(ts),len(ts)//10):
     plt.plot(xs, pxt_dts[i,:], c='r')
     plt.plot(xs, up_dx[i,:], c='blue')
