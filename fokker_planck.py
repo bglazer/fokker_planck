@@ -74,7 +74,7 @@ class Pxt(torch.nn.Module):
         xs = x.repeat((1,ts.shape[0])).T.unsqueeze(2)
         tss = ts.repeat((x.shape[0],1)).T.unsqueeze(2).to(device)
         xts = torch.concatenate((xs,tss), dim=2)
-        ps = torch.exp(pxt.model(xts))
+        ps = torch.relu(pxt.model(xts))
         return ps
 
     # Compute the probability density p(x,t) using the neural network
@@ -113,11 +113,15 @@ ht = 1e-3
 # Initialize the neural networks
 pxt = Pxt(20, 3, device)
 ux = Ux(200, 3, device)
+# Initialize the weights of pxt to be positive
+with torch.no_grad():
+    for param in pxt.parameters():
+        param.copy_(torch.abs(param)/10)
 # Initialize the optimizers
 pxt_optimizer = torch.optim.Adam(pxt.parameters(), lr=1e-3)
-ux_optimizer = torch.optim.Adam(ux.parameters(), lr=1e-3)
+ux_optimizer = torch.optim.Adam(ux.parameters(), lr=1e-2)
 #%%
-ts = torch.linspace(0, 1, 100, device=device, requires_grad=False)
+ts = torch.linspace(0, 1, 1000, device=device, requires_grad=False)
 # ## %%
 # # NOTE: This is a pre-training step to get p(x, t=0) to match the initial condition
 # # train  p(x, t=0)=p_D0 for all x in the overall distribution
@@ -141,6 +145,8 @@ ht = ts[1] - ts[0]
 l_Spxts = np.zeros(epochs)
 l_p0s = np.zeros(epochs)
 l_fps = np.zeros(epochs)
+l_us = np.zeros(epochs)
+l_pxt_dx = np.zeros(epochs)
 for epoch in range(epochs):
     # Sample from the data distribution
     x = pD.rvs(size=1000)
@@ -148,7 +154,6 @@ for epoch in range(epochs):
     x = torch.tensor(x, device=device, dtype=torch.float32, requires_grad=False)[:,None]
 
     pxt_optimizer.zero_grad()
-    ux_optimizer.zero_grad()
 
     # This is the initial condition p(x, t=0)=p_D0 
     l_p0 = ((pxt(x0, ts=zero) - pX_D0)**2).mean()
@@ -160,9 +165,24 @@ for epoch in range(epochs):
     l_Spxt = ((Spxt[:,0] - px)**2).mean()
     l_Spxt.backward()
 
+    # Smoothness regularization of the d/dx p(x,t) term
+    # l_pxt_dt = ((pxt.dt(x, ts+ht) - pxt.dt(x, ts-ht)/(2*ht))**2).mean()*.00
+    # l_pxt_dt.backward()
+
     # Record the losses
     l_Spxts[epoch] = float(l_Spxt.mean())
     l_p0s[epoch] = float(l_p0.mean())   
+    print(f'{epoch} l_px={float(l_Spxt.mean()):.5f}, l_p0={float(l_p0.mean()):.5f}, ')
+        #   f'l_pxt_dt={float(l_pxt_dt.mean()):.5f}')
+
+    low = float(X1.min())
+    high = float(X1.max())
+    l = low-.25*(high-low) 
+    h = high+.25*(high-low)
+    x = torch.arange(l, h, .01, device=device)[:,None]
+
+    # for epoch in range(epochs):
+    ux_optimizer.zero_grad()
 
     # This is the calculation of the term that ensures the
     # derivatives match the Fokker-Planck equation
@@ -172,13 +192,18 @@ for epoch in range(epochs):
     l_fp = ((pxt_dts + up_dx)**2).mean()
 
     l_fp.backward()
-    
+
+    # Penalize the magnitude of u(x)
+    # l_u = (ux(x)**2).mean()*0
+    # l_u.backward()
+
     # Take a gradient step
     pxt_optimizer.step()
     ux_optimizer.step()
-    print(f'{epoch} l_px={float(l_Spxt.mean()):.5f}, l_p0={float(l_p0.mean()):.5f}, '
-          f'l_fp={float(l_fp.mean()):.5f}')
     l_fps[epoch] = float(l_fp.mean())
+    # l_us[epoch] = float(l_u)
+    print(f'{epoch} l_fp={float(l_fp.mean()):.5f}')#, l_u={float(l_u.mean()):.5f}')
+
 
 
 #%%
@@ -272,10 +297,12 @@ ax2.plot(xs, pD.pdf(xs), c='k', alpha=1, label='p(x)')
 ax2.set_ylabel('p(x)')
 fig.legend()
 # %%
-x = pD0.rvs(size=1000)
+# Simulate the stochastic differential equation using the Euler-Maruyama method
+# with the learned drift term u(x)
+x = pD0.rvs(size=10000)
 x = torch.tensor(x, device=device, dtype=torch.float32, requires_grad=False)[:,None]
 xts = []
-ts = torch.linspace(0, 1, 1500, device=device, requires_grad=False)
+ts = torch.linspace(0, 1, 100, device=device, requires_grad=False)
 ht = ts[1] - ts[0]
 for i in range(len(ts)):
     t = ts[i:i+1]
@@ -336,7 +363,7 @@ sim_cum_pxt_err = (pX[:,None] - sim_cum_pxt)**2
 
 plt.title('Error of Cumulative mean of p(x,t)\n'
           f'Error ∫pxt(x,t)dt = {l_Spxt:.5f}\n'
-          f'Error Simulation = {sim_cum_pxt_err.mean():.5f}')
+          f'Error Simulation = {sim_cum_pxt_err[:,-1].mean():.5f}')
 plt.imshow(sim_cum_pxt_err, aspect='auto', interpolation='none', cmap='viridis')
 plt.ylabel('x')
 plt.xlabel('timestep (t)')
