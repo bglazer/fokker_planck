@@ -53,14 +53,17 @@ class Ux(torch.nn.Module):
     def __init__(self, hidden_dim, n_layers, device):
         super(Ux, self).__init__()
         # The drift term of the Fokker-Planck equation, modeled by a neural network
-        self.model = MLP(1, 1, hidden_dim, n_layers).to(device)
+        self.model = MLP(2, 1, hidden_dim, n_layers).to(device)
 
-    def forward(self, x):
-        return self.model(x)
+    def forward(self, x, ts):
+        xs = x.repeat((1,ts.shape[0])).T.unsqueeze(2)
+        tss = ts.repeat((x.shape[0],1)).T.unsqueeze(2).to(device)
+        xts = torch.concatenate((xs,tss), dim=2)
+        return self.model(xts)
     
     # Compute the derivative of u(x) with respect to x
-    def dx(self, x, hx=1e-3):
-        xgrad = (self(x+hx) - self(x-hx))/(2*hx)
+    def dx(self, x, ts, hx=1e-3):
+        xgrad = (self(x+hx, ts) - self(x-hx, ts))/(2*hx)
         return xgrad
 
 # The p(x,t) term of the Fokker-Planck equation, modeled by a neural network
@@ -113,7 +116,7 @@ ht = 1e-3
 # Generate a continuous distribution from the data
 # Initialize the neural networks
 pxt = Pxt(20, 3, device)
-ux = Ux(20, 3, device)
+ux = Ux(200, 3, device)
 # Initialize the optimizers
 pxt_optimizer = torch.optim.Adam(pxt.parameters(), lr=1e-3)
 ux_optimizer = torch.optim.Adam(ux.parameters(), lr=1e-3)
@@ -139,9 +142,9 @@ for i in range(500):
 ts = torch.linspace(0, 1, 100, device=device, requires_grad=False)
 ht = ts[1] - ts[0]
 
-l_fps = np.zeros(epochs)
 l_Spxts = np.zeros(epochs)
 l_p0s = np.zeros(epochs)
+l_pxt_dts = np.zeros(epochs)
 for epoch in range(epochs):
     # Sample from the data distribution
     x = pD.rvs(size=1000)
@@ -149,7 +152,6 @@ for epoch in range(epochs):
     x = torch.tensor(x, device=device, dtype=torch.float32, requires_grad=False)[:,None]
 
     pxt_optimizer.zero_grad()
-    ux_optimizer.zero_grad()
     # This is the initial condition p(x, t=0)=p_D0 
     l_p0 = ((pxt(x0, ts=zero) - pX_D0)**2).mean()
     l_p0.backward()
@@ -160,42 +162,43 @@ for epoch in range(epochs):
     l_Spxt = ((Spxt[:,0] - px)**2).mean()
     l_Spxt.backward()
 
-    # This is the calculation of the term that ensures the
-    # derivatives match the Fokker-Planck equation
-    # d/dx p(x,t) = -d/dt (u(x) p(x,t))
-    up_dx = (ux(x+hx) * pxt(x+hx, ts) - ux(x-hx) * pxt(x-hx, ts))/(2*hx)
-    pxt_dts = pxt.dt(x, ts)
-    l_fp = ((pxt_dts + up_dx)**2).mean()
+    # Smoothness of d/dt p(x,t), this might help train u(x,t)
+    # Second derivative measures smoothness
+    l_pxt_dt = (((pxt.dt(x+hx, ts) - pxt.dt(x-hx, ts))/(2*hx))**2).mean()
+    l_pxt_dt = l_pxt_dt*0
+    l_pxt_dt.backward()
 
-    l_fp.backward()
-
-    pxt_optimizer.step()
-    ux_optimizer.step()
-
-    print(f'{epoch} l_fp={float(l_fp.mean()):.5f}, l_px={float(l_Spxt.mean()):.5f}, l_p0={float(l_p0.mean()):.5f}')
-    l_fps[epoch] = float(l_fp.mean())
+    # Record the losses
     l_Spxts[epoch] = float(l_Spxt.mean())
     l_p0s[epoch] = float(l_p0.mean())   
+    l_pxt_dts[epoch] = float(l_pxt_dt)
+    # Take a gradient step
+    pxt_optimizer.step()
+    print(f'{epoch} l_px={float(l_Spxt.mean()):.5f}, l_p0={float(l_p0.mean()):.5f}, l_pxt_dt={float(l_pxt_dt.mean()):.5f}')
 #%%
-for epoch in range(1000):
+l_fps = np.zeros(epochs)
+
+for epoch in range(epochs):
+    ux_optimizer.zero_grad()
+    x = torch.linspace(X1.min(), X1.max(), 1000, device=device, dtype=torch.float32, requires_grad=False)[:,None]
     # This is the calculation of the term that ensures the
     # derivatives match the Fokker-Planck equation
     # d/dx p(x,t) = -d/dt (u(x) p(x,t))
-    x = pD.rvs(size=1000)
-    x = torch.tensor(x, device=device, dtype=torch.float32, requires_grad=False)[:,None]
-    ts = torch.linspace(0, 1, 1000, device=device, requires_grad=False)
-    up_dx = (ux(x+hx) * pxt(x+hx, ts).detach() - ux(x-hx) * pxt(x-hx, ts).detach())/(2*hx)
+    up_dx = (ux(x+hx, ts) * pxt(x+hx, ts).detach() - ux(x-hx, ts) * pxt(x-hx, ts).detach())/(2*hx)
     pxt_dts = pxt.dt(x, ts).detach()
     l_fp = ((pxt_dts + up_dx)**2).mean()
 
     l_fp.backward()
 
     ux_optimizer.step()
-
     print(f'{epoch} l_fp={float(l_fp.mean()):.5f}, l_px={float(l_Spxt.mean()):.5f}, l_p0={float(l_p0.mean()):.5f}')
+    l_fps[epoch] = float(l_fp.mean())
+
 #%%
 plt.title('Loss curves')
 plt.plot(l_fps[10:], label='l_fp')
+#%%
+plt.title('Loss curves')
 plt.plot(l_Spxts[10:], label='l_Spxt')
 plt.plot(l_p0s[10:], label='l_p0')
 plt.xlabel('Epoch')
@@ -208,7 +211,7 @@ colors = matplotlib.colormaps.get_cmap('viridis')
 xs = torch.arange(X1.min(), X1.max(), .01, device=device)[:,None]
 
 pxts = pxt(xs, ts).squeeze().T.cpu().detach().numpy()
-uxs = ux(xs).squeeze().cpu().detach().numpy()
+uxs = ux(xs, ts).squeeze().cpu().detach().numpy()
 xs = xs.squeeze().cpu().detach().numpy()
 
 plt.title('p(x,t)')
@@ -223,6 +226,21 @@ plt.ylabel('p(x,t)')
 sm = plt.cm.ScalarMappable(cmap=colors, norm=plt.Normalize(vmin=0, vmax=1))
 sm.set_array([])
 plt.colorbar(sm, label='timestep (t)')
+
+#%%
+# Plot the Fokker Planck terms
+xs = torch.arange(X1.min(), X1.max(), .01, device=device)[:,None]
+up_dx = (ux(xs+hx, ts) * pxt(xs+hx, ts) - ux(xs-hx, ts) * pxt(xs-hx, ts))/(2*hx)
+pxt_dts = pxt.dt(xs, ts)
+up_dx = up_dx.detach().cpu().numpy()[:,:,0]
+pxt_dts = pxt_dts.detach().cpu().numpy()[:,:,0]
+xs = xs.detach().cpu().numpy()[:,0]
+
+for i in range(0,len(ts),10):
+    plt.plot(xs, pxt_dts[i,:], c='r')
+    plt.plot(xs, up_dx[i,:], c='blue')
+labels = ['d/dt p(x,t)', 'd/dx u(x) p(x,t)']
+plt.legend(labels)
 
 # %%
 # This plots the cumulative mean of p(x,t) at each timestep t, going from t=0 (left) to t=1 (right)
@@ -253,7 +271,10 @@ plt.colorbar()
 # Plot the u(x) term for all x
 fig, ax1 = plt.subplots(1,1, figsize=(10,5))
 plt.title('u(x) vs p(x)')
-ax1.plot(xs, uxs, label='u(x)')
+for i in range(0, ts.shape[0], int(len(ts)/10)):
+    t = ts[i]
+    ax1.plot(xs, uxs[i], c=colors(float(t)), alpha=.6)
+# ax1.plot(xs, uxs, label='u(x)')
 # Add vertical and horizontal grid lines
 ax1.grid()
 ax1.set_ylabel('u(x)')
@@ -268,15 +289,17 @@ x = torch.tensor(x, device=device, dtype=torch.float32, requires_grad=False)[:,N
 xts = []
 ts = torch.linspace(0, 1, 1500, device=device, requires_grad=False)
 ht = ts[1] - ts[0]
-for t in ts:
+for i in range(len(ts)):
+    t = ts[i:i+1]
     # Compute the drift term
-    u = ux(x)
+    u = ux(x, t)
     # Compute the diffusion term
     # Generate a set of random numbers
     dW = torch.randn_like(x) * torch.sqrt(ht)
     sigma = torch.ones_like(x)
     # Compute the change in x
     dx = u * ht + sigma * dW
+    dx = dx.squeeze(0)
     # Update x
     x = x + dx
     xts.append(x.cpu().detach().numpy())
@@ -285,9 +308,8 @@ xts = np.concatenate(xts, axis=1)
 # Plot the resulting probability densities at each timestep
 for i in range(0, ts.shape[0], 10):
     t = ts[i]
-    heights,bins = np.histogram(xts[:,i])
+    heights,bins = np.histogram(xts[:,i], bins=xs)
     plt.plot(bins[:-1], heights, color=colors(float(t)), alpha=.2)
-# %%
 # %%
 # This plots the cumulative mean of p(x,t) at each timestep t, going from t=0 (left) to t=1 (right)
 # Higher probability is shown in yellow, lower probability is shown in blue
