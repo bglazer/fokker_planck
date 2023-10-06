@@ -53,13 +53,10 @@ class Ux(torch.nn.Module):
     def __init__(self, hidden_dim, n_layers, device):
         super(Ux, self).__init__()
         # The drift term of the Fokker-Planck equation, modeled by a neural network
-        self.model = MLP(2, 1, hidden_dim, n_layers).to(device)
+        self.model = MLP(1, 1, hidden_dim, n_layers).to(device)
 
-    def forward(self, x, ts):
-        xs = x.repeat((1,ts.shape[0])).T.unsqueeze(2)
-        tss = ts.repeat((x.shape[0],1)).T.unsqueeze(2).to(device)
-        xts = torch.concatenate((xs,tss), dim=2)
-        return self.model(xts)
+    def forward(self, x):
+        return self.model(x)
     
     # Compute the derivative of u(x) with respect to x
     def dx(self, x, ts, hx=1e-3):
@@ -109,7 +106,6 @@ _=plt.hist(X0.cpu().numpy(), bins=30, alpha=.3)
 _=plt.hist(X1.cpu().numpy(), bins=30, alpha=.3)
 #%%
 epochs = 500
-steps = 1
 hx = 1e-3
 ht = 1e-3
 #%%
@@ -164,8 +160,9 @@ for epoch in range(epochs):
 
     # Smoothness of d/dt p(x,t), this might help train u(x,t)
     # Second derivative measures smoothness
+    alpha = 0
     l_pxt_dt = (((pxt.dt(x+hx, ts) - pxt.dt(x-hx, ts))/(2*hx))**2).mean()
-    l_pxt_dt = l_pxt_dt*0
+    l_pxt_dt = l_pxt_dt*alpha
     l_pxt_dt.backward()
 
     # Record the losses
@@ -176,23 +173,32 @@ for epoch in range(epochs):
     pxt_optimizer.step()
     print(f'{epoch} l_px={float(l_Spxt.mean()):.5f}, l_p0={float(l_p0.mean()):.5f}, l_pxt_dt={float(l_pxt_dt.mean()):.5f}')
 #%%
-l_fps = np.zeros(epochs)
+low = X1.min()
+high = X1.max()
+w = high - low
+x = torch.linspace(low-.25*w, high+.25*w, 1000, device=device, dtype=torch.float32, requires_grad=False)[:,None]
 
-for epoch in range(epochs):
+fp_epochs = epochs*5
+l_fps = np.zeros(fp_epochs)
+for epoch in range(fp_epochs):
     ux_optimizer.zero_grad()
-    x = torch.linspace(X1.min(), X1.max(), 1000, device=device, dtype=torch.float32, requires_grad=False)[:,None]
     # This is the calculation of the term that ensures the
     # derivatives match the Fokker-Planck equation
     # d/dx p(x,t) = -d/dt (u(x) p(x,t))
-    up_dx = (ux(x+hx, ts) * pxt(x+hx, ts).detach() - ux(x-hx, ts) * pxt(x-hx, ts).detach())/(2*hx)
+    up_dx = (ux(x+hx) * pxt(x+hx, ts).detach() - ux(x-hx) * pxt(x-hx, ts).detach())/(2*hx)
     pxt_dts = pxt.dt(x, ts).detach()
     l_fp = ((pxt_dts + up_dx)**2).mean()
 
     l_fp.backward()
+    
+    # Regularize the magnitude of u(x)
+    l_ux = (ux(x)**2).mean()*0
+    l_ux.backward()
 
     ux_optimizer.step()
-    print(f'{epoch} l_fp={float(l_fp.mean()):.5f}, l_px={float(l_Spxt.mean()):.5f}, l_p0={float(l_p0.mean()):.5f}')
+    print(f'{epoch} l_fp={float(l_fp.mean()):.5f}, l_ux={float(l_ux):.5f}')
     l_fps[epoch] = float(l_fp.mean())
+
 
 #%%
 plt.title('Loss curves')
@@ -207,36 +213,41 @@ plt.legend()
 
 # %%
 # Plot the predicted p(x,t) at each timestep t
-colors = matplotlib.colormaps.get_cmap('viridis')
-xs = torch.arange(X1.min(), X1.max(), .01, device=device)[:,None]
+viridis = matplotlib.colormaps.get_cmap('viridis')
+greys = matplotlib.colormaps.get_cmap('Greys')
+purples = matplotlib.colormaps.get_cmap('Purples')
+low = float(X1.min())
+high = float(X1.max())
+l = low-.25*(high-low) 
+h = high+.25*(high-low)
+xs = torch.arange(l, h, .01, device=device)[:,None]
 
 pxts = pxt(xs, ts).squeeze().T.cpu().detach().numpy()
-uxs = ux(xs, ts).squeeze().cpu().detach().numpy()
-xs = xs.squeeze().cpu().detach().numpy()
+uxs = ux(xs).squeeze().cpu().detach().numpy()
+up_dx = (ux(xs+hx) * pxt(xs+hx, ts) - ux(xs-hx) * pxt(xs-hx, ts))/(2*hx)
+pxt_dts = pxt.dt(xs, ts)
+up_dx = up_dx.detach().cpu().numpy()[:,:,0]
+pxt_dts = pxt_dts.detach().cpu().numpy()[:,:,0]
 
+xs = xs.squeeze().cpu().detach().numpy()
+#%%
 plt.title('p(x,t)')
 plt.plot(xs, pD.pdf(xs), c='k', alpha=1)
 plt.plot(xs, pD0.pdf(xs), c='k', alpha=1)
 for i in range(0, ts.shape[0], int(len(ts)/10)):
     t = ts[i]
-    plt.plot(xs, pxts[:,i], c=colors(float(t)))
+    plt.plot(xs, pxts[:,i], c=viridis(float(t)))
 plt.xlabel('x')
 plt.ylabel('p(x,t)')
 # Add a colorbar to show the timestep
-sm = plt.cm.ScalarMappable(cmap=colors, norm=plt.Normalize(vmin=0, vmax=1))
+sm = plt.cm.ScalarMappable(cmap=viridis, norm=plt.Normalize(vmin=0, vmax=1))
 sm.set_array([])
 plt.colorbar(sm, label='timestep (t)')
 
 #%%
 # Plot the Fokker Planck terms
-xs = torch.arange(X1.min(), X1.max(), .01, device=device)[:,None]
-up_dx = (ux(xs+hx, ts) * pxt(xs+hx, ts) - ux(xs-hx, ts) * pxt(xs-hx, ts))/(2*hx)
-pxt_dts = pxt.dt(xs, ts)
-up_dx = up_dx.detach().cpu().numpy()[:,:,0]
-pxt_dts = pxt_dts.detach().cpu().numpy()[:,:,0]
-xs = xs.detach().cpu().numpy()[:,0]
 
-for i in range(0,len(ts),10):
+for i in range(0,len(ts),len(ts)//10):
     plt.plot(xs, pxt_dts[i,:], c='r')
     plt.plot(xs, up_dx[i,:], c='blue')
 labels = ['d/dt p(x,t)', 'd/dx u(x) p(x,t)']
@@ -246,8 +257,8 @@ plt.legend(labels)
 # This plots the cumulative mean of p(x,t) at each timestep t, going from t=0 (left) to t=1 (right)
 # Higher probability is shown in yellow, lower probability is shown in blue
 plt.title('Cumulative mean of p(x,t)')
-cum_pxt = pxts.cumsum(axis=1) / np.arange(1, ts.shape[0]+1)
-plt.imshow(cum_pxt, aspect='auto', interpolation='none', cmap='viridis')
+sim_cum_pxt = pxts.cumsum(axis=1) / np.arange(1, ts.shape[0]+1)
+plt.imshow(sim_cum_pxt, aspect='auto', interpolation='none', cmap='viridis')
 plt.ylabel('x')
 plt.xlabel('timestep (t)')
 plt.colorbar()
@@ -255,7 +266,7 @@ plt.colorbar()
 # This plots the error of the cumulative mean of p(x,t) at each timestep t, going from t=0 (left) to t=1 (right)
 pxs = pD.pdf(xs)
 plt.title('Error of cumulative mean of p(x,t)')
-plt.imshow(pxs[:,None] - cum_pxt, aspect='auto', interpolation='none', cmap='RdBu')
+plt.imshow(pxs[:,None] - sim_cum_pxt, aspect='auto', interpolation='none', cmap='RdBu')
 plt.ylabel('x')
 plt.xlabel('timestep (t)')
 plt.colorbar()
@@ -271,14 +282,13 @@ plt.colorbar()
 # Plot the u(x) term for all x
 fig, ax1 = plt.subplots(1,1, figsize=(10,5))
 plt.title('u(x) vs p(x)')
-for i in range(0, ts.shape[0], int(len(ts)/10)):
-    t = ts[i]
-    ax1.plot(xs, uxs[i], c=colors(float(t)), alpha=.6)
+ax1.plot(xs, uxs, c='blue', alpha=.6)
 # ax1.plot(xs, uxs, label='u(x)')
 # Add vertical and horizontal grid lines
 ax1.grid()
 ax1.set_ylabel('u(x)')
 ax1.set_xlabel('x')
+ax1.axhline(0, c='r', alpha=.5)
 ax2 = ax1.twinx()
 ax2.plot(xs, pD.pdf(xs), c='k', alpha=1, label='p(x)')
 ax2.set_ylabel('p(x)')
@@ -292,7 +302,7 @@ ht = ts[1] - ts[0]
 for i in range(len(ts)):
     t = ts[i:i+1]
     # Compute the drift term
-    u = ux(x, t)
+    u = ux(x)
     # Compute the diffusion term
     # Generate a set of random numbers
     dW = torch.randn_like(x) * torch.sqrt(ht)
@@ -306,29 +316,50 @@ for i in range(len(ts)):
 xts = np.concatenate(xts, axis=1)
 #%%
 # Plot the resulting probability densities at each timestep
-for i in range(0, ts.shape[0], 10):
+low = float(xs.min())
+high = float(xs.max())
+bins = np.linspace(low, high, 30)
+w = bins[1] - bins[0]
+for i in range(0, ts.shape[0], ts.shape[0]//10):
     t = ts[i]
-    heights,bins = np.histogram(xts[:,i], bins=xs)
-    plt.plot(bins[:-1], heights, color=colors(float(t)), alpha=.2)
+    heights,bins = np.histogram(xts[:,i], 
+                                bins=bins,
+                                density=True)
+    plt.bar(bins[:-1], heights, width=w, color=viridis(float(t)), alpha=.2)
+
+for i in range(0, pxts.shape[1], pxts.shape[1]//10):
+    t = ts[i]
+    plt.plot(xs, pxts[:,i], color='blue', alpha=.2)
+labels = ['Simulation', 'Fokker-Planck theoretical']
+artists = [plt.Line2D([0], [0], color=c, alpha=.2) for c in ['red', 'blue']]
+plt.legend(artists, labels)
+plt.title('p(x,t)')
 # %%
 # This plots the cumulative mean of p(x,t) at each timestep t, going from t=0 (left) to t=1 (right)
 # Higher probability is shown in yellow, lower probability is shown in blue
+sim_pxts = np.zeros((bins.shape[0]-1, ts.shape[0]))
+for i in range(0, ts.shape[0]):
+    heights,bins = np.histogram(xts[:,i], 
+                                bins=bins,
+                                density=True)
+    sim_pxts[:,i] = heights
+
 plt.title('Cumulative mean of p(x,t)')
-cum_pxt = pxts.cumsum(axis=1) / np.arange(1, pxts.shape[1]+1)[None,:]
-plt.imshow(cum_pxt, aspect='auto', interpolation='none', cmap='viridis')
+sim_cum_pxt = sim_pxts.cumsum(axis=1) / np.arange(1, sim_pxts.shape[1]+1)[None,:]
+plt.imshow(sim_cum_pxt, aspect='auto', interpolation='none', cmap='viridis')
 plt.ylabel('x')
 plt.xlabel('timestep (t)')
 plt.colorbar() 
 # %%
 # This plots the cumulative mean of p(x,t) at each timestep t, going from t=0 (left) to t=1 (right)
 # Higher probability is shown in yellow, lower probability is shown in blue
-pX = pD.pdf(xs)
-cum_pxt = pX[:,None] - pxts.cumsum(axis=1) / np.arange(1, pxts.shape[1]+1)[None,:]
+pX = pD.pdf(bins[:-1])
+sim_cum_pxt_err = (pX[:,None] - sim_cum_pxt)**2
 
 plt.title('Error of Cumulative mean of p(x,t)\n'
           f'Error ∫pxt(x,t)dt = {l_Spxt:.5f}\n'
-          f'Error Simulation = {(pX - cum_pxt.mean(axis=1)).mean():.5f}')
-plt.imshow(cum_pxt, aspect='auto', interpolation='none', cmap='viridis')
+          f'Error Simulation = {sim_cum_pxt_err.mean():.5f}')
+plt.imshow(sim_cum_pxt_err, aspect='auto', interpolation='none', cmap='viridis')
 plt.ylabel('x')
 plt.xlabel('timestep (t)')
 plt.colorbar() 
