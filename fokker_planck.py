@@ -111,7 +111,6 @@ hx = 1e-3
 ht = 1e-3
 #%%
 # Generate a continuous distribution from the data
-pD = gen_p(X1.cpu().numpy(), bins=100)
 # Initialize the neural networks
 pxt = Pxt(20, 3, device)
 ux = Ux(20, 3, device)
@@ -123,7 +122,8 @@ ts = torch.linspace(0, 1, 100, device=device, requires_grad=False)
 # ## %%
 # # NOTE: This is a pre-training step to get p(x, t=0) to match the initial condition
 # # train  p(x, t=0)=p_D0 for all x in the overall distribution
-pD0 = gen_p(X0.cpu().numpy(), bins=100)
+pD = gen_p(X1.cpu().numpy(), bins=50)
+pD0 = gen_p(X0.cpu().numpy(), bins=50)
 x0 = torch.linspace(X1.min(), X1.max(), 1000, device=device, requires_grad=False)[:,None]
 pX_D0 = torch.tensor(pD0.pdf(x0.cpu().numpy()), device=device, dtype=torch.float32, requires_grad=False)
 pxt0_optimizer = torch.optim.Adam(pxt.parameters(), lr=1e-3)
@@ -172,10 +172,27 @@ for epoch in range(epochs):
     pxt_optimizer.step()
     ux_optimizer.step()
 
-    print(f'{i} l_fp={float(l_fp.mean()):.5f}, l_px={float(l_Spxt.mean()):.5f}, l_p0={float(l_p0.mean()):.5f}')
+    print(f'{epoch} l_fp={float(l_fp.mean()):.5f}, l_px={float(l_Spxt.mean()):.5f}, l_p0={float(l_p0.mean()):.5f}')
     l_fps[epoch] = float(l_fp.mean())
     l_Spxts[epoch] = float(l_Spxt.mean())
     l_p0s[epoch] = float(l_p0.mean())   
+#%%
+for epoch in range(1000):
+    # This is the calculation of the term that ensures the
+    # derivatives match the Fokker-Planck equation
+    # d/dx p(x,t) = -d/dt (u(x) p(x,t))
+    x = pD.rvs(size=1000)
+    x = torch.tensor(x, device=device, dtype=torch.float32, requires_grad=False)[:,None]
+    ts = torch.linspace(0, 1, 1000, device=device, requires_grad=False)
+    up_dx = (ux(x+hx) * pxt(x+hx, ts).detach() - ux(x-hx) * pxt(x-hx, ts).detach())/(2*hx)
+    pxt_dts = pxt.dt(x, ts).detach()
+    l_fp = ((pxt_dts + up_dx)**2).mean()
+
+    l_fp.backward()
+
+    ux_optimizer.step()
+
+    print(f'{epoch} l_fp={float(l_fp.mean()):.5f}, l_px={float(l_Spxt.mean()):.5f}, l_p0={float(l_p0.mean()):.5f}')
 #%%
 plt.title('Loss curves')
 plt.plot(l_fps[10:], label='l_fp')
@@ -197,7 +214,7 @@ xs = xs.squeeze().cpu().detach().numpy()
 plt.title('p(x,t)')
 plt.plot(xs, pD.pdf(xs), c='k', alpha=1)
 plt.plot(xs, pD0.pdf(xs), c='k', alpha=1)
-for i in range(0, ts.shape[0], 10):
+for i in range(0, ts.shape[0], int(len(ts)/10)):
     t = ts[i]
     plt.plot(xs, pxts[:,i], c=colors(float(t)))
 plt.xlabel('x')
@@ -205,7 +222,7 @@ plt.ylabel('p(x,t)')
 # Add a colorbar to show the timestep
 sm = plt.cm.ScalarMappable(cmap=colors, norm=plt.Normalize(vmin=0, vmax=1))
 sm.set_array([])
-plt.colorbar(sm, label='timestep - t')
+plt.colorbar(sm, label='timestep (t)')
 
 # %%
 # This plots the cumulative mean of p(x,t) at each timestep t, going from t=0 (left) to t=1 (right)
@@ -214,7 +231,7 @@ plt.title('Cumulative mean of p(x,t)')
 cum_pxt = pxts.cumsum(axis=1) / np.arange(1, ts.shape[0]+1)
 plt.imshow(cum_pxt, aspect='auto', interpolation='none', cmap='viridis')
 plt.ylabel('x')
-plt.xlabel('timestep - t')
+plt.xlabel('timestep (t)')
 plt.colorbar()
 # %%
 # This plots the error of the cumulative mean of p(x,t) at each timestep t, going from t=0 (left) to t=1 (right)
@@ -222,7 +239,7 @@ pxs = pD.pdf(xs)
 plt.title('Error of cumulative mean of p(x,t)')
 plt.imshow(pxs[:,None] - cum_pxt, aspect='auto', interpolation='none', cmap='RdBu')
 plt.ylabel('x')
-plt.xlabel('timestep - t')
+plt.xlabel('timestep (t)')
 plt.colorbar()
 
 #%%
@@ -230,7 +247,7 @@ plt.colorbar()
 plt.title('p(x,t) at each timestep t')
 plt.imshow(pxts, aspect='auto', interpolation='none', cmap='viridis')
 plt.ylabel('x')
-plt.xlabel('timestep - t')
+plt.xlabel('timestep (t)')
 plt.colorbar()
 # %%
 # Plot the u(x) term for all x
@@ -245,4 +262,52 @@ ax2 = ax1.twinx()
 ax2.plot(xs, pD.pdf(xs), c='k', alpha=1, label='p(x)')
 ax2.set_ylabel('p(x)')
 fig.legend()
+# %%
+x = pD0.rvs(size=1000)
+x = torch.tensor(x, device=device, dtype=torch.float32, requires_grad=False)[:,None]
+xts = []
+ts = torch.linspace(0, 1, 1500, device=device, requires_grad=False)
+ht = ts[1] - ts[0]
+for t in ts:
+    # Compute the drift term
+    u = ux(x)
+    # Compute the diffusion term
+    # Generate a set of random numbers
+    dW = torch.randn_like(x) * torch.sqrt(ht)
+    sigma = torch.ones_like(x)
+    # Compute the change in x
+    dx = u * ht + sigma * dW
+    # Update x
+    x = x + dx
+    xts.append(x.cpu().detach().numpy())
+xts = np.concatenate(xts, axis=1)
+#%%
+# Plot the resulting probability densities at each timestep
+for i in range(0, ts.shape[0], 10):
+    t = ts[i]
+    heights,bins = np.histogram(xts[:,i])
+    plt.plot(bins[:-1], heights, color=colors(float(t)), alpha=.2)
+# %%
+# %%
+# This plots the cumulative mean of p(x,t) at each timestep t, going from t=0 (left) to t=1 (right)
+# Higher probability is shown in yellow, lower probability is shown in blue
+plt.title('Cumulative mean of p(x,t)')
+cum_pxt = pxts.cumsum(axis=1) / np.arange(1, pxts.shape[1]+1)[None,:]
+plt.imshow(cum_pxt, aspect='auto', interpolation='none', cmap='viridis')
+plt.ylabel('x')
+plt.xlabel('timestep (t)')
+plt.colorbar() 
+# %%
+# This plots the cumulative mean of p(x,t) at each timestep t, going from t=0 (left) to t=1 (right)
+# Higher probability is shown in yellow, lower probability is shown in blue
+pX = pD.pdf(xs)
+cum_pxt = pX[:,None] - pxts.cumsum(axis=1) / np.arange(1, pxts.shape[1]+1)[None,:]
+
+plt.title('Error of Cumulative mean of p(x,t)\n'
+          f'Error ∫pxt(x,t)dt = {l_Spxt:.5f}\n'
+          f'Error Simulation = {(pX - cum_pxt.mean(axis=1)).mean():.5f}')
+plt.imshow(cum_pxt, aspect='auto', interpolation='none', cmap='viridis')
+plt.ylabel('x')
+plt.xlabel('timestep (t)')
+plt.colorbar() 
 # %%
