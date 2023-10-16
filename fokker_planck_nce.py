@@ -172,10 +172,6 @@ noise = D.MultivariateNormal(loc=torch.ones(1, device=device)*2,
                              covariance_matrix=torch.eye(1, device=device)*6)
 nce = NCE(pxt, noise)
 
-# Initialize the weights of pxt to be positive
-# with torch.no_grad():
-#     for param in pxt.parameters():
-#         param.copy_(torch.abs(param)/10)
 # Initialize the optimizers
 pxt_optimizer = torch.optim.Adam(pxt.parameters(), lr=5e-4)
 ux_optimizer = torch.optim.Adam(ux.parameters(), lr=1e-3)
@@ -224,9 +220,8 @@ for epoch in range(epochs):
 
     # Take a gradient step
     pxt_optimizer.step()
-    # ux_optimizer.step()
+    ux_optimizer.step()
     l_fps[epoch] = float(l_fp.mean())
-    # l_us[epoch] = float(l_u)
     print(f'{epoch} l_nce_px={float(l_nce_px):.5f}, acc_px={float(acc_px):.4f}, '
           f'l_nce_p0={float(l_nce_p0):.5f}, acc_p0={float(acc_p0):.4f}, '
           f'l_fp={float(l_fp):.5f}')
