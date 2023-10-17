@@ -124,7 +124,7 @@ class Pxt(torch.nn.Module):
         """
         Marginalize out the t dimension to get log(p(x))
         """
-        return torch.logsumexp(self.log_pxt(x, ts), dim=0) - torch.log(torch.tensor(ts.shape[0], device=self.device, dtype=torch.float32))
+        return torch.logsumexp(self.log_pxt(x, ts), dim=0) - torch.log(torch.tensor(ts.shape[0], device=x.device, dtype=torch.float32))
     
     def dx(self, x, ts, hx=1e-3):
         """
@@ -141,7 +141,12 @@ class Pxt(torch.nn.Module):
         return tgrad
     
 class CellDelta(nn.Module):
-    def __init__(self, input_dim, hidden_dim, num_layers, noise) -> None:
+    """
+    CellDelta is a learned model of cell differentiation in single-cell RNA-seq single timepoint data.
+    It models the developmental trajectory of cells as a driven stochastic process
+    # TODO expand this docstring to describe the rationale of the model
+    """
+    def __init__(self, input_dim, hidden_dim, num_layers, noise, device) -> None:
         """
         Initialize the CellDelta model with the given hyperparameters.
 
@@ -150,14 +155,16 @@ class CellDelta(nn.Module):
             hidden_dim (int): The number of hidden units in each layer.
             num_layers (int): The number of layers in the model.
             noise (torch.distributions): The noise distribution to use for the NCE loss.
+            device (torch.device): The device to use for the model.
 
         Returns:
             None
         """
         super().__init__()
-        self.ux = Ux(input_dim, hidden_dim, num_layers)
-        self.pxt = Pxt(input_dim, hidden_dim, num_layers)
+        self.ux = Ux(input_dim, hidden_dim, num_layers).to(device)
+        self.pxt = Pxt(input_dim, hidden_dim, num_layers).to(device)
         self.noise = noise
+        self.device = device
         # Add the component models (ux, pxt, nce) to a module list
         self.models = torch.nn.ModuleDict({'ux':self.ux, 'pxt':self.pxt})
     
@@ -240,11 +247,11 @@ class CellDelta(nn.Module):
 
             # Calculate the Noise-Constrastive Loss of the distribution
             # of p(x,t) marginalized over t: p(x) = \int p(x,t) dt
-            l_nce_px, acc_px = self.nce_loss(x, ts=ts, n_samples=n_samples)
+            l_nce_px, acc_px = self.nce_loss(x, ts=ts)
             l_nce_px.backward()
             
             # Calculate the Noise-Constrastive Loss of the initial distribution
-            l_nce_p0, acc_p0 = self.nce_loss(x0, ts=zero, n_samples=n_samples)
+            l_nce_p0, acc_p0 = self.nce_loss(x0, ts=zero)
             l_nce_p0.backward()
 
             # This is the calculation of the term that ensures the
