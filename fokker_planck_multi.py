@@ -3,7 +3,7 @@ import numpy as np
 import torch
 import matplotlib
 import matplotlib.pyplot as plt
-# import scanpy as sc
+import scanpy as sc
 from scipy.stats import rv_histogram
 from torch.nn import Linear, ReLU
 
@@ -33,11 +33,11 @@ class MLP(torch.nn.Module):
         return x
 
 #%%
-# genotype='wildtype'
-# dataset = 'net'
-# adata = sc.read_h5ad(f'../../data/{genotype}_{dataset}.h5ad')
-# data = adata.layers['raw']
-# X = data.toarray()
+genotype='wildtype'
+dataset = 'net'
+adata = sc.read_h5ad(f'../../data/{genotype}_{dataset}.h5ad')
+data = adata.layers['raw']
+X = data.toarray()
 device = 'cuda:0'
 
 #%%
@@ -91,6 +91,8 @@ class Pxt(torch.nn.Module):
     def dt(self, x, ts, ht=1e-3):
         tgrad = (self.p(x, ts+ht) - self.p(x, ts-ht))/(2*ht)
         return tgrad
+
+# %%
 
 #%%
 # Generate simple test data

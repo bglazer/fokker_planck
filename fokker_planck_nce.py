@@ -4,137 +4,10 @@ import torch
 import matplotlib
 import matplotlib.pyplot as plt
 # import scanpy as sc
-from scipy.stats import rv_histogram
-from torch.nn import Linear, ReLU
-import torch.nn as nn
 import torch.distributions as D
+from 
 
-#%%
-# Define models 
 
-# Generic Dense Multi-Layer Perceptron (MLP), which is just a stack of linear layers with ReLU activations
-# input_dim: dimension of input
-# output_dim: dimension of output
-# hidden_dim: dimension of hidden layers
-# num_layers: number of hidden layers
-class MLP(torch.nn.Module):
-    def __init__(self, input_dim, output_dim, hidden_dim, num_layers, input_bias=True):
-        super(MLP, self).__init__()
-        layers = []
-        layers.append(Linear(input_dim, hidden_dim, bias=input_bias))
-        layers.append(ReLU())
-        for i in range(num_layers - 1):
-            layers.append(Linear(hidden_dim, hidden_dim, bias=False))
-            layers.append(ReLU())
-            # TODO do we need batch norm here?
-        layers.append(Linear(hidden_dim, output_dim, bias=False))
-        # layers.append(LeakyReLU())
-        # Register the layers as a module of the model
-        self.layers = torch.nn.ModuleList(layers)
-
-    def forward(self, x):
-        for layer in self.layers:
-            x = layer(x)
-        return x
-
-class NCE(nn.Module):
-    def __init__(self, model, noise):
-        super(NCE, self).__init__()
-        # The normalizing constant logZ(θ)        
-        self.c = nn.Parameter(torch.tensor([1.], requires_grad=True))
-
-        self.model = model
-        self.noise = noise
-
-    def classify(self, x, ts):
-        logp_x = self.log_px(x, ts)  # logp(x)
-        logq_x = self.noise.log_prob(x).unsqueeze(1)  # logq(x)
-
-        # Classification of noise vs target
-        r_x = torch.sigmoid(logp_x - logq_x)
-        return r_x
-    
-    def loss(self, x, ts, n_samples):
-        # Generate samples from noise
-        y = self.noise.sample((n_samples,))
-
-        logp_x = self.model.log_px(x, ts)  # logp(x)
-        logq_x = self.noise.log_prob(x).unsqueeze(1)  # logq(x)
-        logp_y = self.model.log_px(y, ts)  # logp(y)
-        logq_y = self.noise.log_prob(y).unsqueeze(1)  # logq(y)
-
-        value_x = logp_x - torch.logsumexp(torch.cat([logp_x, logq_x], dim=1), dim=1, keepdim=True)  # logp(x)/(logp(x) + logq(x))
-        value_y = logq_y - torch.logsumexp(torch.cat([logp_y, logq_y], dim=1), dim=1, keepdim=True)  # logq(y)/(logp(y) + logq(y))
-
-        v = value_x.mean() + value_y.mean()
-
-        # Classification of noise vs target
-        r_x = torch.sigmoid(logp_x - logq_x)
-        r_y = torch.sigmoid(logq_y - logp_y)
-
-        # Compute the classification accuracy
-        acc = ((r_x > 1/2).sum() + (r_y > 1/2).sum()).cpu().numpy() / (len(x) + len(y))
-        
-        return -v, acc
-
-    def log_density(self, x, ts):
-        return self.model.log_px(x, ts) - self.noise.log_prob(x).unsqueeze(1) - self.c
-        
-# Define models for the Fokker-Planck equation
-# The u(x) drift term of the Fokker-Planck equation, modeled by a neural network
-class Ux(torch.nn.Module):
-    def __init__(self, hidden_dim, n_layers, device):
-        super(Ux, self).__init__()
-        # The drift term of the Fokker-Planck equation, modeled by a neural network
-        self.model = MLP(1, 1, hidden_dim, n_layers).to(device)
-
-    def forward(self, x):
-        return self.model(x)
-    
-    # Compute the derivative of u(x) with respect to x
-    def dx(self, x, ts, hx=1e-3):
-        xgrad = (self(x+hx, ts) - self(x-hx, ts))/(2*hx)
-        return xgrad
-
-# The p(x,t) term of the Fokker-Planck equation, modeled by a neural network
-class Pxt(torch.nn.Module):
-    def __init__(self, hidden_dim, n_layers, device):
-        super(Pxt, self).__init__()
-        self.device = device
-
-        self.model = MLP(2, 1, hidden_dim, n_layers).to(device)
-
-    def log_pxt(self, x, ts):
-        ts = ts if ts is None else ts
-        # Repeat the x and t vectors for each timestep in the ts range
-        xs = x.repeat((1, ts.shape[0])).T.unsqueeze(2)
-        ts_ = ts.repeat((x.shape[0],1)).T.unsqueeze(2)
-        # Concatentate them together to match the input the MLP model
-        xts = torch.concatenate((xs,ts_), dim=2)
-        log_ps = self.model(xts)
-        # Ensure that the sum of the log_pxts is 1 for every t
-        # log_ps = (log_ps.transpose(1,0) - torch.logsumexp(log_ps, dim=1).detach()).transpose(0,1)
-        return log_ps
-    
-    def pxt(self, x, ts):
-        return torch.exp(self.log_pxt(x, ts))
-
-    def forward(self, x, ts):
-        return self.pxt(x, ts)
-    
-    # Marginalize out the t dimension to get p(x)
-    def log_px(self, x, ts):
-        return torch.logsumexp(self.log_pxt(x, ts), dim=0) - torch.log(torch.tensor(ts.shape[0], device=self.device, dtype=torch.float32))
-    
-    # Compute the partial derivative of p(x,t) with respect to x
-    def dx(self, x, ts, hx=1e-3):
-        xgrad = (self.pxt(x+hx, ts) - self.pxt(x-hx, ts))/(2*hx)
-        return xgrad
-
-    # Compute the partial derivative of p(x,t) with respect to t
-    def dt(self, x, ts, ht=1e-3):
-        tgrad = (self.pxt(x, ts+ht) - self.pxt(x, ts-ht))/(2*ht)
-        return tgrad
 
 #%%
 # genotype='wildtype'
@@ -164,67 +37,12 @@ hx = 1e-3
 ht = ts[1] - ts[0]
 zero = torch.zeros(1, requires_grad=False).to(device)
 
-#%%
-# Initialize the neural networks
-pxt = Pxt(hidden_dim=20, n_layers=3, device=device)
-ux = Ux(hidden_dim=20, n_layers=3, device=device)
 noise = D.MultivariateNormal(loc=torch.ones(1, device=device)*2, 
                              covariance_matrix=torch.eye(1, device=device)*6)
-nce = NCE(pxt, noise)
 
-# Initialize the optimizers
-pxt_optimizer = torch.optim.Adam(pxt.parameters(), lr=5e-4)
-ux_optimizer = torch.optim.Adam(ux.parameters(), lr=1e-3)
 
 #%%
-l_nce_pxs = np.zeros(epochs)
-l_p0s = np.zeros(epochs)
-l_fps = np.zeros(epochs)
-l_us = np.zeros(epochs)
-l_pxt_dx = np.zeros(epochs)
-for epoch in range(epochs):
-    # Sample from the data distribution
-    rand_idxs = torch.randperm(len(X))
-    x = X[rand_idxs[:n_samples]]
-    x0 = X0
 
-    pxt_optimizer.zero_grad()
-    ux_optimizer.zero_grad()
-
-    # This is the initial condition p(x, t=0)=p_D0 
-    l_nce_p0, acc_p0 = nce.loss(x0, ts=zero, n_samples=1000)
-    l_nce_p0.backward()
-
-    # p(x) marginalized over t, NCE loss
-    l_nce_px, acc_px = nce.loss(x, ts=ts, n_samples=1000)
-    l_nce_px.backward()
-
-    # Record the losses
-    l_nce_pxs[epoch] = float(l_nce_px.mean())
-    l_p0s[epoch] = float(l_nce_p0.mean())   
-
-    low = float(X.min())
-    high = float(X.max())
-    l = low-.25*(high-low) 
-    h = high+.25*(high-low)
-    x = torch.arange(l, h, .01, device=device)[:,None]
-
-    # This is the calculation of the term that ensures the
-    # derivatives match the Fokker-Planck equation
-    # d/dx p(x,t) = -d/dt (u(x) p(x,t))
-    up_dx = (ux(x+hx) * pxt(x+hx, ts) - ux(x-hx) * pxt(x-hx, ts))/(2*hx)
-    pxt_dts = pxt.dt(x, ts)
-    l_fp = ((pxt_dts + up_dx)**2).mean()
-
-    l_fp.backward()
-
-    # Take a gradient step
-    pxt_optimizer.step()
-    ux_optimizer.step()
-    l_fps[epoch] = float(l_fp.mean())
-    print(f'{epoch} l_nce_px={float(l_nce_px):.5f}, acc_px={float(acc_px):.4f}, '
-          f'l_nce_p0={float(l_nce_p0):.5f}, acc_p0={float(acc_p0):.4f}, '
-          f'l_fp={float(l_fp):.5f}')
 
 
 
@@ -232,7 +50,7 @@ for epoch in range(epochs):
 fig, axs = plt.subplots(3, 1, figsize=(10,10))
 axs[0].plot(l_fps[10:], label='l_fp')
 axs[1].plot(l_nce_pxs[10:], label='l_nce_pxs')
-axs[2].plot(l_p0s[10:], label='l_nce_p0')
+axs[2].plot(l_nce_p0s[10:], label='l_nce_p0')
 [axs[i].set_xlabel('Epoch') for i in range(len(axs))]
 [axs[i].set_ylabel('Loss') for i in range(len(axs))]
 [axs[i].legend() for i in range(len(axs))]

@@ -91,6 +91,6 @@ plt.colorbar()
 #%%
 # Calculate the log probability of the target distribution
 # Plot the target distribution
-height, bins = np.histogram(p.detach().cpu().numpy(), bins=100, density=True)
+height, bins = np.histogram(log_density.detach().cpu().numpy(), bins=100, density=True)
 plt.bar(bins[:-1], height, alpha=0.5)
 # %%
