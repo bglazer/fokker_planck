@@ -20,6 +20,20 @@ X0 = torch.randn((1000, 1), device=device)
 # Final distribution is initial distribution plus another normal shifted by +4
 X1 = torch.randn((1000, 1), device=device)+4
 X = torch.vstack((X0, X1))
+#%%
+# %%
+import scanpy as sc
+genotype='wildtype'
+dataset = 'net'
+adata = sc.read_h5ad(f'{genotype}_{dataset}.h5ad')
+nmp_cell_mask = adata.obs['cell_type'] == 'NMP'
+gene = 'POU5F1'
+X = adata[:, adata.var_names == gene].X.toarray()
+X = torch.tensor(X, device=device, dtype=torch.float32)
+X0 = adata[nmp_cell_mask, adata.var_names == gene].X.toarray()
+X0 = torch.tensor(X0, device=device, dtype=torch.float32)
+
+#%%
 # Plot the two distributions
 _=plt.hist(X0.cpu().numpy(), bins=30, alpha=.3, label='X0')
 # _=plt.hist(X1.cpu().numpy(), bins=30, alpha=.3, label='X1')
@@ -27,19 +41,24 @@ _=plt.hist(X.cpu().numpy(), bins=30, alpha=.3, label='X')
 plt.legend()
 
 #%%
-ts = torch.linspace(0, 1, 100, device=device, requires_grad=False)
+ts = torch.linspace(0, 1, 100, device=device, requires_grad=True)
 epochs = 1500
 n_samples = 1000
 hx = 1e-3
 ht = ts[1] - ts[0]
-zero = torch.zeros(1, requires_grad=False).to(device)
+zero = torch.zeros(1, requires_grad=True).to(device)
 
 noise = D.MultivariateNormal(loc=torch.ones(1, device=device)*2, 
                              covariance_matrix=torch.eye(1, device=device)*6)
 
 #%%
 # Initialize the model
-celldelta = CellDelta(input_dim=1, hidden_dim=64, num_layers=2, noise=noise, device=device)
+ux_dropout = 0
+pxt_dropout = 0
+
+celldelta = CellDelta(input_dim=1, noise=noise, device=device,
+                      ux_hidden_dim=64, ux_layers=2, ux_dropout=ux_dropout,
+                      pxt_hidden_dim=64, pxt_layers=2, pxt_dropout=pxt_dropout)
 
 #%%
 # Train the model
@@ -71,7 +90,7 @@ l = low-.25*(high-low)
 h = high+.25*(high-low)
 xs = torch.arange(l, h, .01, device=device)[:,None]
 
-pxts = celldelta.pxt(xs, ts).squeeze().T.cpu().detach().numpy()
+pxts = torch.exp(celldelta.pxt(xs, ts)).squeeze().T.cpu().detach().numpy()
 uxs = celldelta.ux(xs).squeeze().cpu().detach().numpy()
 up_dx = (celldelta.ux(xs+hx) * celldelta.pxt(xs+hx, ts) - celldelta.ux(xs-hx) * celldelta.pxt(xs-hx, ts))/(2*hx)
 pxt_dts = celldelta.pxt.dt(xs, ts)
@@ -151,6 +170,7 @@ x = X0.clone().detach()
 xts = []
 ts = torch.linspace(0, 1, 100, device=device, requires_grad=False)
 ht = ts[1] - ts[0]
+zero_boundary = True
 for i in range(len(ts)):
     # Compute the drift term
     u = celldelta.ux(x)
@@ -164,6 +184,8 @@ for i in range(len(ts)):
     dx = dx.squeeze(0)
     # Update x
     x = x + dx
+    if zero_boundary:
+        x[x < 0] = 0
     xts.append(x.cpu().detach().numpy())
 xts = np.concatenate(xts, axis=1)
 #%%
@@ -219,11 +241,4 @@ w = sim_mean_bins[1] - sim_mean_bins[0]
 plt.bar(sim_mean_bins[:-1], sim_mean_dist, width=w, alpha=.3, label='Simulation')
 
 plt.bar(data_bins[:-1], data_dist, width=w, alpha=.3, label='Data')
-
 # %%
-import scanpy as sc
-genotype='wildtype'
-dataset = 'net'
-adata = sc.read_h5ad(f'{genotype}_{dataset}.h5ad')
-data = adata.layers['raw']
-X = data.toarray()

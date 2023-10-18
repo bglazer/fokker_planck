@@ -43,7 +43,7 @@ class Ux(torch.nn.Module):
     """
     The u(x) drift term of the Fokker-Planck equation, modeled by a neural network
     """
-    def __init__(self, input_dim, hidden_dim, n_layers):
+    def __init__(self, input_dim, hidden_dim, n_layers, dropout=0.5):
         """
         Args:
             input_dim (int): The dimensionality of the data.
@@ -56,6 +56,8 @@ class Ux(torch.nn.Module):
         super(Ux, self).__init__()
         # The drift term of the Fokker-Planck equation, modeled by a neural network
         self.model = MLP(input_dim, input_dim, hidden_dim, n_layers)
+        # Apply dropout to the model
+        self.dropout = nn.Dropout(p=dropout)
 
     def forward(self, x):
         return self.model(x)
@@ -69,7 +71,7 @@ class Ux(torch.nn.Module):
 
 # The p(x,t) term of the Fokker-Planck equation, modeled by a neural network
 class Pxt(torch.nn.Module):
-    def __init__(self, input_dim, hidden_dim, n_layers):
+    def __init__(self, input_dim, hidden_dim, n_layers, dropout=0.5):
         """
         The p(x,t) term of the Fokker-Planck equation, modeled by a neural network
 
@@ -84,14 +86,16 @@ class Pxt(torch.nn.Module):
         super(Pxt, self).__init__()
 
         # Add another dimension to the input for time
-        self.model = MLP(input_dim+1, input_dim, hidden_dim, n_layers)
+        self.model = MLP(input_dim+1, 1, hidden_dim, n_layers)
+        # Apply dropout to the model
+        self.dropout = nn.Dropout(p=dropout)
 
     def log_pxt(self, x, ts):
         """
         Compute the log probability of the data at the given time points and data points.
 
         Args:
-            x (torch.tensor): The input data of shape (n_cells, n_genes).
+            x (torch.tensor): The input data of shape (n_batch, n_cells, n_genes).
             ts (torch.tensor): The time points at which to evaluate the model of shape (n_timesteps,).
         
         Returns:
@@ -99,17 +103,13 @@ class Pxt(torch.nn.Module):
             torch.tensor: The log probability of the data at each time and data point of shape (n_cells, n_timesteps).
         """
 
-        ts = ts if ts is None else ts
         # Repeat the x and t vectors for each timestep in the ts range
-        xs = x.repeat((1, ts.shape[0])).T.unsqueeze(2)
+        xs = x.repeat((ts.shape[0],1,1,))
         ts_ = ts.repeat((x.shape[0],1)).T.unsqueeze(2)
         # Concatentate them together to match the input the MLP model
         xts = torch.concatenate((xs,ts_), dim=2)
         log_ps = self.model(xts)
-        # Ensure that the sum of the log_pxts is 1 for every t
-        # log_ps = (log_ps.transpose(1,0) - torch.logsumexp(log_ps, dim=1).detach()).transpose(0,1)
         return log_ps
-    
     
     def pxt(self, x, ts):
         """
@@ -118,7 +118,7 @@ class Pxt(torch.nn.Module):
         return torch.exp(self.log_pxt(x, ts))
 
     def forward(self, x, ts):
-        return self.pxt(x, ts)
+        return self.log_pxt(x, ts)
     
     def log_px(self, x, ts):
         """
@@ -146,14 +146,21 @@ class CellDelta(nn.Module):
     It models the developmental trajectory of cells as a driven stochastic process
     # TODO expand this docstring to describe the rationale of the model
     """
-    def __init__(self, input_dim, hidden_dim, num_layers, noise, device) -> None:
+    def __init__(self, input_dim, 
+                 ux_hidden_dim, ux_layers, ux_dropout,
+                 pxt_hidden_dim, pxt_layers, pxt_dropout,
+                 noise, device) -> None:
         """
         Initialize the CellDelta model with the given hyperparameters.
 
         Args:
             input_dim (int): The dimensionality of the input data.
-            hidden_dim (int): The number of hidden units in each layer.
-            num_layers (int): The number of layers in the model.
+            ux_hidden_dim (int): The number of hidden units in each layer for the UX model.
+            ux_layers (int): The number of layers in the UX model.
+            ux_dropout (float): The dropout probability for the UX model.
+            pxt_hidden_dim (int): The number of hidden units in each layer for the PXT model.
+            pxt_layers (int): The number of layers in the PXT model.
+            pxt_dropout (float): The dropout probability for the PXT model.
             noise (torch.distributions): The noise distribution to use for the NCE loss.
             device (torch.device): The device to use for the model.
 
@@ -161,8 +168,8 @@ class CellDelta(nn.Module):
             None
         """
         super().__init__()
-        self.ux = Ux(input_dim, hidden_dim, num_layers).to(device)
-        self.pxt = Pxt(input_dim, hidden_dim, num_layers).to(device)
+        self.ux = Ux(input_dim, ux_hidden_dim, ux_layers, ux_dropout).to(device)
+        self.pxt = Pxt(input_dim, pxt_hidden_dim, pxt_layers, pxt_dropout).to(device)
         self.noise = noise
         self.device = device
         # Add the component models (ux, pxt, nce) to a module list
@@ -201,7 +208,7 @@ class CellDelta(nn.Module):
         
         return -v, acc
 
-    def optimize(self, X, X0, ts, restart=True, pxt_lr=5e-4, ux_lr=1e-3, n_epochs=100, n_samples=1000, hx=1e-3, verbose=False):
+    def optimize(self, X, X0, ts, restart=True, pxt_lr=5e-4, ux_lr=1e-3, alpha_fp=1, n_epochs=100, n_samples=1000, hx=1e-3, verbose=False):
         """
         Optimize the cell delta model parameters using the provided training data.
 
@@ -224,6 +231,7 @@ class CellDelta(nn.Module):
             self.pxt_optimizer = torch.optim.Adam(self.pxt.parameters(), lr=pxt_lr)
             self.ux_optimizer = torch.optim.Adam(self.ux.parameters(), lr=ux_lr)
         
+        # Convenience variable for the time t=0
         zero = torch.zeros(1, requires_grad=False).to(self.device)
         
         l_nce_pxs = np.zeros(n_epochs)
@@ -256,10 +264,19 @@ class CellDelta(nn.Module):
 
             # This is the calculation of the term that ensures the
             # derivatives match the Fokker-Planck equation
-            # d/dx p(x,t) = -d/dt (u(x) p(x,t))
-            up_dx = (ux(x+hx) * pxt(x+hx, ts) - ux(x-hx) * pxt(x-hx, ts))/(2*hx)
+            # d/dt p(x,t) = \sum_{i=1}^{N} -d/dx_i (u(x) p(x,t))
+            xs = x.repeat((ts.shape[0],1,1))
+            ts_ = ts.repeat((x.shape[0],1)).T.unsqueeze(2)
+            # Concatentate them together to match the input the MLP model
+            xts = torch.concatenate((xs,ts_), dim=2)
+            up_pxt = ux(x)*torch.exp(pxt.model(xts))
+            up_dx = torch.autograd.grad(outputs=up_pxt, 
+                                        inputs=xts, 
+                                        grad_outputs=torch.ones_like(up_pxt),
+                                        create_graph=True)[0]
+            up_dx = up_dx[:,:,:-1].sum(dim=2, keepdim=True)
             pxt_dts = pxt.dt(x, ts)
-            l_fp = ((pxt_dts + up_dx)**2).mean()
+            l_fp = ((pxt_dts + up_dx)**2).mean()*alpha_fp
             l_fp.backward()
 
             # Take a gradient step
