@@ -62,13 +62,18 @@ class Ux(torch.nn.Module):
     def forward(self, x):
         return self.model(x)
     
-    def dx(self, x, ts, hx=1e-3):
+    def dx(self, x, hx=1e-3):
         """
         Compute the derivative of u(x) with respect to x
         """
-        xgrad = (self(x+hx, ts) - self(x-hx, ts))/(2*hx)
-        return xgrad
-
+        ux = self.model(x)
+        dudx = torch.autograd.grad(outputs=ux, 
+                                   inputs=x, 
+                                   grad_outputs=torch.ones_like(ux),
+                                   create_graph=True,
+                                   retain_graph=True)[0]
+        return dudx
+    
 # The p(x,t) term of the Fokker-Planck equation, modeled by a neural network
 class Pxt(torch.nn.Module):
     def __init__(self, input_dim, hidden_dim, n_layers, dropout=0.5):
@@ -90,6 +95,14 @@ class Pxt(torch.nn.Module):
         # Apply dropout to the model
         self.dropout = nn.Dropout(p=dropout)
 
+    def xts(self, x, ts):
+        # Repeat the x and t vectors for each timestep in the ts range
+        xs = x.repeat((ts.shape[0],1,1,))
+        ts_ = ts.repeat((x.shape[0],1)).T.unsqueeze(2)
+        # Concatentate them together to match the input the MLP model
+        xts = torch.concatenate((xs,ts_), dim=2)
+        return xts
+
     def log_pxt(self, x, ts):
         """
         Compute the log probability of the data at the given time points and data points.
@@ -103,11 +116,7 @@ class Pxt(torch.nn.Module):
             torch.tensor: The log probability of the data at each time and data point of shape (n_cells, n_timesteps).
         """
 
-        # Repeat the x and t vectors for each timestep in the ts range
-        xs = x.repeat((ts.shape[0],1,1,))
-        ts_ = ts.repeat((x.shape[0],1)).T.unsqueeze(2)
-        # Concatentate them together to match the input the MLP model
-        xts = torch.concatenate((xs,ts_), dim=2)
+        xts = self.xts(x, ts)
         log_ps = self.model(xts)
         return log_ps
     
@@ -126,19 +135,24 @@ class Pxt(torch.nn.Module):
         """
         return torch.logsumexp(self.log_pxt(x, ts), dim=0) - torch.log(torch.tensor(ts.shape[0], device=x.device, dtype=torch.float32))
     
-    def dx(self, x, ts, hx=1e-3):
+    def dx_dt(self, x, ts, hx=1e-3):
         """
-        Compute the partial derivative of p(x,t) with respect to x
-        """
-        xgrad = (self.pxt(x+hx, ts) - self.pxt(x-hx, ts))/(2*hx)
-        return xgrad
+        Compute the partial derivative of log p(x,t) with respect to x
 
-    def dt(self, x, ts, ht=1e-3):
+        Returns:
+            torch.tensor: The partial derivative of log p(x,t) with respect to x
+            torch.tensor: The partial derivative of log p(x,t) with respect to t
         """
-        Compute the partial derivative of p(x,t) with respect to t
-        """
-        tgrad = (self.pxt(x, ts+ht) - self.pxt(x, ts-ht))/(2*ht)
-        return tgrad
+        xts = self.xts(x, ts)
+        log_pxt = self.model(xts)
+        dpdx = torch.autograd.grad(outputs=log_pxt, 
+                                   inputs=xts, 
+                                   grad_outputs=torch.ones_like(log_pxt),
+                                   create_graph=True,
+                                   retain_graph=True)[0]
+        # The :-1 is to get the gradient with respect to x
+        # The -1 is to get the gradient with respect to t
+        return dpdx[:,:,:-1], dpdx[:,:,-1].unsqueeze(2)
     
 class CellDelta(nn.Module):
     """
@@ -232,7 +246,7 @@ class CellDelta(nn.Module):
             self.ux_optimizer = torch.optim.Adam(self.ux.parameters(), lr=ux_lr)
         
         # Convenience variable for the time t=0
-        zero = torch.zeros(1, requires_grad=False).to(self.device)
+        zero = torch.zeros(1, requires_grad=True).to(self.device)
         
         l_nce_pxs = np.zeros(n_epochs)
         l_nce_p0s = np.zeros(n_epochs)
@@ -247,7 +261,8 @@ class CellDelta(nn.Module):
         for epoch in range(n_epochs):
             # Sample from the data distribution
             rand_idxs = torch.randperm(len(X))[:n_samples]
-            x = X[rand_idxs]
+            x = X[rand_idxs].clone().detach()
+            x.requires_grad=True
             x0 = X0
 
             self.pxt_optimizer.zero_grad()
@@ -263,20 +278,15 @@ class CellDelta(nn.Module):
             l_nce_p0.backward()
 
             # This is the calculation of the term that ensures the
-            # derivatives match the Fokker-Planck equation
-            # d/dt p(x,t) = \sum_{i=1}^{N} -d/dx_i (u(x) p(x,t))
-            xs = x.repeat((ts.shape[0],1,1))
-            ts_ = ts.repeat((x.shape[0],1)).T.unsqueeze(2)
-            # Concatentate them together to match the input the MLP model
-            xts = torch.concatenate((xs,ts_), dim=2)
-            up_pxt = ux(x)*torch.exp(pxt.model(xts))
-            up_dx = torch.autograd.grad(outputs=up_pxt, 
-                                        inputs=xts, 
-                                        grad_outputs=torch.ones_like(up_pxt),
-                                        create_graph=True)[0]
-            up_dx = up_dx[:,:,:-1].sum(dim=2, keepdim=True)
-            pxt_dts = pxt.dt(x, ts)
-            l_fp = ((pxt_dts + up_dx)**2).mean()*alpha_fp
+            # derivatives match the log scale Fokker-Planck equation
+            # q(x,t) = log p(x,t)
+            # d/dt q(x,t) = \sum_{i=1}^{N} -[u(x)*dq(x,t)/dx_i + du(x)/dx]
+            dqdx, dqdt = pxt.dx_dt(x, ts)
+            dudx = ux.dx(x)
+            dxi = ux(x)*dqdx + dudx
+            dx = dxi.sum(dim=2, keepdim=True)
+            
+            l_fp = ((dqdt + dx)**2).mean()*alpha_fp
             l_fp.backward()
 
             # Take a gradient step

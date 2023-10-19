@@ -49,7 +49,7 @@ celldelta = CellDelta(input_dim=n_genes,
 
 #%%
 # Train the model
-losses = celldelta.optimize(X, X0, ts, restart=True, pxt_lr=5e-4, ux_lr=5e-4, alpha_fp=100, 
+losses = celldelta.optimize(X, X0, ts, restart=True, pxt_lr=5e-4, ux_lr=5e-4, alpha_fp=1, 
                             n_epochs=epochs, n_samples=n_samples, hx=hx, verbose=True)
 #%%
 l_fps = losses['l_fp']
@@ -74,7 +74,7 @@ purples = matplotlib.colormaps.get_cmap('Purples')
 xs = X.clone().detach()
 pxts = celldelta.pxt(xs, ts).squeeze().T.cpu().detach().numpy()
 uxs = celldelta.ux(xs).squeeze().cpu().detach().numpy()
-pxt_dts = celldelta.pxt.dt(xs, ts)
+_,pxt_dts = celldelta.pxt.dx_dt(xs, ts)
 pxt_dts = pxt_dts.detach().cpu().numpy()[:,:,0]
 
 xs = xs.squeeze().cpu().detach().numpy()
@@ -111,9 +111,9 @@ for i in range(len(tsim)):
     # Compute the diffusion term
     # Generate a set of random numbers
     dW = torch.randn_like(x) * torch.sqrt(ht)
-    sigma = torch.ones_like(x)
+    sigma = torch.ones_like(x)*0
     # Compute the change in x
-    dx = u*5 * ht + sigma * dW
+    dx = u * ht + sigma * dW
     # print(f'{float(u.mean()):.5f}, {float(ht):.3f}, {float(dW.mean()): .5f}, {float(dx.mean()): .5f}')
     dx = dx.squeeze(0)
     # Update x

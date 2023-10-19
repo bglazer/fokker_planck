@@ -29,9 +29,9 @@ adata = sc.read_h5ad(f'{genotype}_{dataset}.h5ad')
 nmp_cell_mask = adata.obs['cell_type'] == 'NMP'
 gene = 'POU5F1'
 X = adata[:, adata.var_names == gene].X.toarray()
-X = torch.tensor(X, device=device, dtype=torch.float32)
+X = torch.tensor(X, device=device, dtype=torch.float32, requires_grad=True)
 X0 = adata[nmp_cell_mask, adata.var_names == gene].X.toarray()
-X0 = torch.tensor(X0, device=device, dtype=torch.float32)
+X0 = torch.tensor(X0, device=device, dtype=torch.float32, requires_grad=True)
 
 #%%
 # Plot the two distributions
@@ -62,7 +62,10 @@ celldelta = CellDelta(input_dim=1, noise=noise, device=device,
 
 #%%
 # Train the model
-losses = celldelta.optimize(X, X0, ts, restart=True, pxt_lr=5e-4, ux_lr=1e-3, 
+# X.requires_grad = True
+# X0.requires_grad = True
+# ts.requires_grad = True
+losses = celldelta.optimize(X, X0, ts, restart=True, pxt_lr=5e-4, ux_lr=1e-3, alpha_fp=1, 
                             n_epochs=epochs, n_samples=n_samples, hx=hx, verbose=True)
 #%%
 l_fps = losses['l_fp']
@@ -93,7 +96,7 @@ xs = torch.arange(l, h, .01, device=device)[:,None]
 pxts = torch.exp(celldelta.pxt(xs, ts)).squeeze().T.cpu().detach().numpy()
 uxs = celldelta.ux(xs).squeeze().cpu().detach().numpy()
 up_dx = (celldelta.ux(xs+hx) * celldelta.pxt(xs+hx, ts) - celldelta.ux(xs-hx) * celldelta.pxt(xs-hx, ts))/(2*hx)
-pxt_dts = celldelta.pxt.dt(xs, ts)
+_,pxt_dts = celldelta.pxt.dx_dt(xs, ts)
 up_dx = up_dx.detach().cpu().numpy()[:,:,0]
 pxt_dts = pxt_dts.detach().cpu().numpy()[:,:,0]
 
@@ -101,10 +104,10 @@ xs = xs.squeeze().cpu().detach().numpy()
 #%%
 # Plot the predicted p(x,t) at each timestep t
 plt.title('p(x,t)')
-x_density, x_bins = np.histogram(X.cpu().numpy(), bins=30, density=True)
+x_density, x_bins = np.histogram(X.detach().cpu().numpy(), bins=30, density=True)
 w = x_bins[1] - x_bins[0]
 plt.bar(height=x_density, x=x_bins[:-1], width=w, alpha=.3, label='X')
-plt.hist(X0.cpu().numpy(), bins=30, alpha=.3, label='X0', density=True, color='orange')
+plt.hist(X0.detach().cpu().numpy(), bins=30, alpha=.3, label='X0', density=True, color='orange')
 for i in range(0, ts.shape[0], int(len(ts)/10)):
     t = ts[i]
     z = pxts[:,i].sum()
@@ -158,7 +161,7 @@ ax1.set_ylabel('u(x)')
 ax1.set_xlabel('x')
 ax1.axhline(0, c='r', alpha=.5)
 ax2 = ax1.twinx()
-data_dist, data_bins = np.histogram(X.cpu().numpy().flatten(), bins=30, density=True)
+data_dist, data_bins = np.histogram(X.detach().cpu().numpy().flatten(), bins=30, density=True)
 w = data_bins[1] - data_bins[0]
 ax2.bar(data_bins[:-1], data_dist, width=w, alpha=.3, label='Data')
 ax2.set_ylabel('p(x)')
@@ -233,8 +236,8 @@ plt.colorbar()
 plt.title('Final cumulative distribution of simulations vs data distribution')
 # Remove timesteps where the simulation diverged
 # i.e. the simulation went outside the range of the data (>2stds away from the data mean)
-std = X.cpu().numpy().std()*2
-good_runs = ((np.abs(xts - X.cpu().numpy().mean()) > std).sum(axis=1) == 0)
+std = X.detach().cpu().numpy().std()*2
+good_runs = ((np.abs(xts - X.detach().cpu().numpy().mean()) > std).sum(axis=1) == 0)
 print(f'Fraction of good runs: {good_runs.sum()/good_runs.shape[0]:.2f}')
 sim_mean_dist, sim_mean_bins = np.histogram(xts[good_runs].flatten(), bins=30, density=True)
 w = sim_mean_bins[1] - sim_mean_bins[0]
