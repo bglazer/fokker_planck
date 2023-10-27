@@ -41,23 +41,38 @@ ts = torch.linspace(0, 1, 100, device=device, requires_grad=True)
 
 #%%
 class Model(torch.nn.Module):
-    def __init__(self, device) -> None:
+    def __init__(self, input_dim, hidden_dim, layers, device) -> None:
         super().__init__()
-        self.nn = MLP(input_dim=1, hidden_dim=64, output_dim=1, num_layers=2).to(device)
+        self.nn = MLP(input_dim=input_dim, hidden_dim=hidden_dim, output_dim=1, num_layers=layers).to(device)
         self.device = device
         
-    def simulate(self, n_samples, ts):
+    def sample(self, x0, n_steps, step_size, eps=None):
         """
-        Langevin sampling of distribution X at times ts
+        MCMC sampling of the model
         """
-        x = torch.randn((n_samples, 1), device=self.device)*6+2 #.requires_grad_(True)
-        return x
-        # xs = []
-        # dt = float(ts[1] - ts[0])
-        # for t in ts:
-        #     x = x - self.ux(x)*dt + torch.randn_like(x)*np.sqrt(dt)
-        #     xs.append(x)
-        # return torch.cat(xs, dim=1)
+        samples = torch.zeros((n_steps, x0.shape[0], x0.shape[1]), device=self.device)
+        for i in range(n_steps):
+            # Sample from a normal distribution centered at
+            # the current state
+            d = torch.randn_like(x0)*step_size
+            # Add the delta to the current state
+            x0 = x0 + d
+            # Calculate the acceptance probability
+            p0 = self.log_prob(x0)
+            p1 = self.log_prob(x0 + d)
+            if eps is not None:
+                p0 += eps
+                p1 += eps
+            # Accept or reject the new state
+            accept = torch.rand_like(p0) < torch.exp(p1 - p0)
+            # Update the state
+            x0 = torch.where(accept, x0+d, x0)
+            # Save the state
+            samples[i] = x0
+        samples = samples.reshape((-1, x0.shape[1]))
+        # Randomly pick N points from the samples
+        samples = samples[torch.randperm(len(samples))[:len(x0)]] 
+        return samples
     
     def ux(self, x):
         """
@@ -74,58 +89,27 @@ class Model(torch.nn.Module):
         """
         return self.nn(x)
 
-class PerturbationNoise():
-    """
-    Noise distribution that is a version of the current model with perturbed parameters
-    """
-    def __init__(self, model, X, ts, perturbation=0.1):
-        self.perturbation = perturbation
-        self.model = model
-        self.perturb = torch.distributions.MultivariateNormal(loc=torch.zeros(1, device=device),
-                                                              covariance_matrix=torch.eye(1, device=device)*perturbation)
-        self.ts = ts
-        self.X = X
-
-    def perturb_(self):
-        model_params = deepcopy(self.model.state_dict())
-        with torch.no_grad():
-            for param in model_params.values():
-                param += torch.randn_like(param)*self.perturbation
-        self.perturb_model.load_state_dict(model_params)
-
-    def sample(self, n_samples):
-        self.perturb_()
-        samples = self.perturb_model.simulate(n_samples, self.ts)[len(self.ts)//2:].reshape((-1, self.X.shape[1]))
-        samples = samples[:n_samples,:]
-        samples = samples.to(self.model.device)
-        return samples.detach()
-    
-    def log_prob(self, x):
-        # Perturb the model log_probs
-        log_prob = self.perturb_model.log_prob(x)
-        return log_prob.detach()
-
 #%%
-def self_loss(x, model, p_eps, x_eps):
-    noise = torch.ones_like(x)*np.log(p_eps)
+def self_loss(x, model, p_eps, x_eps, sample_steps=10):
+    eps = torch.ones_like(x)*np.log(p_eps)
 
-    y = x + torch.randn_like(x)*x_eps
-
+    y = model.sample(x, n_steps=sample_steps, step_size=x_eps, eps=p_eps) # y ~ q(y|x)
+    
     logp_x = model.log_prob(x) # logp(x)
     logp_y = model.log_prob(y) # logp(y)
-    logq_x = logp_x + noise # logq(x)
-    logq_y = logp_y + noise # logq(y)
+    # logq_x = logp_x + eps # logq(x)
+    # logq_y = logp_y + eps # logq(y)
 
     l2 = np.log(2)
-    lx = logp_x - torch.logaddexp(l2 + logp_x, noise)  # logp(x)/(log(2p(x)) + ε)
-    ly = logp_x - torch.logaddexp(l2 + logp_y, noise)  # logp(x)/(log(2p(y)) + ε)
-    leps = noise - torch.logaddexp(l2 + logp_y, noise)  # log(ε)/(log(2p(y)) + ε)
-    r_x = torch.sigmoid(logp_x - logq_x)
-    r_y = torch.sigmoid(logq_y - logp_y)
-    acc = ((r_x > 1/2).sum() + (r_y > 1/2).sum()).cpu().numpy() / (len(x) + len(y))
+    lx = logp_x - torch.logaddexp(l2 + logp_x, eps)  # logp(x)/(log(2p(x)) + ε)
+    ly = logp_x - torch.logaddexp(l2 + logp_y, eps)  # logp(x)/(log(2p(y)) + ε)
+    leps = eps - torch.logaddexp(l2 + logp_y, eps)  # log(ε)/(log(2p(y)) + ε)
+    # r_x = torch.sigmoid(logp_x - logq_x)
+    # r_y = torch.sigmoid(logq_y - logp_y)
+    # acc = ((r_x > 1/2).sum() + (r_y > 1/2).sum()).cpu().numpy() / (len(x) + len(y))
 
     loss = lx.mean() + ly.mean() + leps.mean()
-    return -loss, acc
+    return -loss, 0
 
 #%%
 def nce_loss(x, model, noise):
@@ -153,15 +137,16 @@ def nce_loss(x, model, noise):
 #%%
 # Initialize the model
 model = Model(device)
-# noise = PerturbationNoise(model, X, ts, perturbation=1e-3)
 optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
 l_nces = []
 accs = []
 #%%
 # Train the model
-for i in range(500):
+for i in range(2000):
     optimizer.zero_grad()
-    l_nce, acc = self_loss(X, model, p_eps=.1, x_eps=.2)
+    x_eps = np.random.uniform(0, .2)
+    p_eps = np.random.uniform(0, .2)
+    l_nce, acc = self_loss(X, model, p_eps=p_eps, x_eps=x_eps)
     l_nce.backward()
     optimizer.step()
     l_nces.append(l_nce.item())
@@ -199,9 +184,138 @@ px_bucket = np.zeros_like(xheight)
 for i in range(len(xheight)):
     px_bucket[i] = pxs[np.logical_and(xs >= xbin[i], xs < xbin[i+1])].sum()
 plt.bar(height=xheight, x=xbin[:-1], width=w, alpha=.3, label='X')
-plt.plot(xbin[:-1], px_bucket)
+plt.bar(x=xbin[:-1], height=px_bucket, width=w, alpha=.3, label='p(x)')
 plt.xlabel('x')
 plt.ylabel('p(x)')
 
+# %%
+adata = sc.read_h5ad(f'{genotype}_{dataset}.h5ad')
+# Get a binary mask of the top 2 genes by variance
+X = adata.X.toarray()
+top_variance_gene_mask = np.zeros_like(adata.var_names, dtype=bool)
+top_variance_gene_mask[np.argsort(X.var(axis=0))[-2:]] = True
+X = adata[:, top_variance_gene_mask].X.toarray()
+X = torch.tensor(X, device=device, dtype=torch.float32, requires_grad=True)
+gene1, gene2 = adata.var_names[top_variance_gene_mask]
+
+# %%
+# Plot the two distributions separately
+fig, axs = plt.subplots(1, 2, figsize=(10,5))
+xnp = X.data.cpu().numpy()
+axs[0].hist(xnp[:,0], bins=30, alpha=1)
+axs[1].hist(xnp[:,1], bins=30, alpha=1)
+axs[0].set_title(gene1)
+axs[1].set_title(gene2)
+
+
+# %%
+# Initialize the model
+model = Model(input_dim=2, 
+              hidden_dim=64,
+              layers=2,
+              device=device)
+# noise = PerturbationNoise(model, X, ts, perturbation=1e-3)
+optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+l_nces = []
+accs = []
+#%%
+# Train the model
+for i in range(2000):
+    optimizer.zero_grad()
+    x_eps = np.random.uniform(0, .2)
+    p_eps = np.random.uniform(0, .2)
+    l_nce, acc = self_loss(X, model, p_eps=p_eps, x_eps=x_eps)
+    l_nce.backward()
+    optimizer.step()
+    l_nces.append(l_nce.item())
+    accs.append(acc)
+    print(f'epoch {i}: l_nce={l_nce.item():.4f} acc={acc:.4f}')
+# %%
+# Plot contours of log probability
+# Make a meshgrid of the axes
+x = np.linspace(xnp.min(), xnp.max(), 200)
+y = np.linspace(xnp.min(), xnp.max(), 200)
+xx, yy = np.meshgrid(x, y)
+# Get the log_prob of every x,y pair
+xy = torch.tensor(np.vstack((xx.flatten(), yy.flatten())).T, device=device, dtype=torch.float32)
+log_prob = model.log_prob(xy)
+# Normalize the log_probs
+log_prob = log_prob - torch.logsumexp(log_prob, dim=0)
+log_prob_np = log_prob.cpu().detach().numpy()
+fig, axs = plt.subplots(1, 2, figsize=(10,5))
+# Give both axes the same dimensions
+axs[0].set_xlim(x.min(), x.max())
+axs[0].set_ylim(y.min(), y.max())
+axs[1].set_xlim(axs[0].get_xlim())
+axs[1].set_ylim(axs[0].get_ylim())
+axs[0].contourf(xx, yy, log_prob_np.reshape(xx.shape), alpha=.5)
+# axs[0].scatter(xnp[:,0], xnp[:,1], alpha=.3, s=1, c='k')
+# Count the number of points in each bin
+xheight, xbin, ybin = np.histogram2d(xnp[:,0], xnp[:,1], bins=30)
+xheight = xheight / xheight.sum()
+xheight = xheight+1e-6
+# Plot the contour
+plt.contourf(xbin[:-1], ybin[:-1], np.log(xheight.T), alpha=.5)
+# plt.scatter(xnp[:,0], xnp[:,1], alpha=.3, s=1, c='k')
+axs[1].contourf(xbin[:-1], ybin[:-1], np.log(xheight.T), alpha=.5)
+# axs[1].scatter(xnp[:,0], xnp[:,1], alpha=.3, s=1, c='k')
+
+# log_prob = model.log_prob(xs)
+
+# %%
+# Generate the two half moons dataset
+from sklearn.datasets import make_moons
+Xnp, y = make_moons(n_samples=1000, noise=.05)
+X = torch.tensor(Xnp, device=device, dtype=torch.float32, requires_grad=True)
+# Plot the distribution
+plt.scatter(Xnp[:,0], Xnp[:,1], c=y)
+# %%
+# Initialize the model
+model = Model(input_dim=2, 
+              hidden_dim=64,
+              layers=2,
+              device=device)
+# noise = PerturbationNoise(model, X, ts, perturbation=1e-3)
+optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+l_nces = []
+#%%
+# Train the model
+for i in range(2000):
+    optimizer.zero_grad()
+    x_eps = np.random.uniform(0, .01)
+    p_eps = np.random.uniform(0, .2)
+    l_nce, _ = self_loss(X, model, p_eps=p_eps, x_eps=x_eps, sample_steps=100)
+    l_nce.backward()
+    optimizer.step()
+    l_nces.append(l_nce.item())
+    print(f'epoch {i}: l_nce={l_nce.item():.4f}')
+
+# %%
+# Plot contours of log probability
+# Make a meshgrid of the axes
+x = np.linspace(Xnp.min(), Xnp.max(), 200)
+y = np.linspace(Xnp.min(), Xnp.max(), 200)
+xx, yy = np.meshgrid(x, y)
+# Get the log_prob of every x,y pair
+xy = torch.tensor(np.vstack((xx.flatten(), yy.flatten())).T, device=device, dtype=torch.float32)
+log_prob = model.log_prob(xy)
+# Normalize the log_probs
+log_prob = log_prob - torch.logsumexp(log_prob, dim=0)
+log_prob_np = log_prob.cpu().detach().numpy()
+fig, axs = plt.subplots(1, 2, figsize=(10,5))
+# Give both axes the same dimensions
+axs[0].set_xlim(x.min(), x.max())
+axs[0].set_ylim(y.min(), y.max())
+axs[1].set_xlim(axs[0].get_xlim())
+axs[1].set_ylim(axs[0].get_ylim())
+axs[0].contourf(xx, yy, np.exp(log_prob_np.reshape(xx.shape)), alpha=.5, levels=30)
+axs[0].scatter(Xnp[:,0], Xnp[:,1], alpha=.3, s=1, c='k')
+# Count the number of points in each bin
+xheight, xbin, ybin = np.histogram2d(Xnp[:,0], Xnp[:,1], bins=30)
+xheight = xheight / xheight.sum()
+xheight = xheight+1e-6
+# Plot the contour
+plt.contourf(xbin[:-1], ybin[:-1], np.log(xheight.T), alpha=.5)
+plt.scatter(Xnp[:,0], Xnp[:,1], alpha=.3, s=1, c='k')
 
 # %%
