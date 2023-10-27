@@ -81,7 +81,8 @@ class PerturbationNoise():
     def __init__(self, model, X, ts, perturbation=0.1):
         self.perturbation = perturbation
         self.model = model
-        self.perturb_model = deepcopy(model)
+        self.perturb = torch.distributions.MultivariateNormal(loc=torch.zeros(1, device=device),
+                                                              covariance_matrix=torch.eye(1, device=device)*perturbation)
         self.ts = ts
         self.X = X
 
@@ -100,10 +101,31 @@ class PerturbationNoise():
         return samples.detach()
     
     def log_prob(self, x):
-        # Perturb the model parameters using dropout
-        self.perturb_()
+        # Perturb the model log_probs
         log_prob = self.perturb_model.log_prob(x)
         return log_prob.detach()
+
+#%%
+def self_loss(x, model, p_eps, x_eps):
+    noise = torch.ones_like(x)*np.log(p_eps)
+
+    y = x + torch.randn_like(x)*x_eps
+
+    logp_x = model.log_prob(x) # logp(x)
+    logp_y = model.log_prob(y) # logp(y)
+    logq_x = logp_x + noise # logq(x)
+    logq_y = logp_y + noise # logq(y)
+
+    l2 = np.log(2)
+    lx = logp_x - torch.logaddexp(l2 + logp_x, noise)  # logp(x)/(log(2p(x)) + ε)
+    ly = logp_x - torch.logaddexp(l2 + logp_y, noise)  # logp(x)/(log(2p(y)) + ε)
+    leps = noise - torch.logaddexp(l2 + logp_y, noise)  # log(ε)/(log(2p(y)) + ε)
+    r_x = torch.sigmoid(logp_x - logq_x)
+    r_y = torch.sigmoid(logq_y - logp_y)
+    acc = ((r_x > 1/2).sum() + (r_y > 1/2).sum()).cpu().numpy() / (len(x) + len(y))
+
+    loss = lx.mean() + ly.mean() + leps.mean()
+    return -loss, acc
 
 #%%
 def nce_loss(x, model, noise):
@@ -131,21 +153,20 @@ def nce_loss(x, model, noise):
 #%%
 # Initialize the model
 model = Model(device)
-noise = PerturbationNoise(model, X, ts, perturbation=1e-3)
+# noise = PerturbationNoise(model, X, ts, perturbation=1e-3)
 optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
 l_nces = []
 accs = []
 #%%
 # Train the model
-for i in range(epochs):
+for i in range(500):
     optimizer.zero_grad()
-    l_nce, acc = nce_loss(X, model, noise)
+    l_nce, acc = self_loss(X, model, p_eps=.1, x_eps=.2)
     l_nce.backward()
     optimizer.step()
     l_nces.append(l_nce.item())
     accs.append(acc)
     print(f'epoch {i}: l_nce={l_nce.item():.4f} acc={acc:.4f}')
-
 
 #%%
 fig, axs = plt.subplots(2, 1, figsize=(10,10))
@@ -173,8 +194,12 @@ plt.title('p(x,t)')
 xheight, xbin = np.histogram(X.detach().cpu().numpy(), bins=30)
 xheight = xheight / xheight.sum()
 w = xbin[1] - xbin[0]
+# Bucket the pxs to match the histogram
+px_bucket = np.zeros_like(xheight)
+for i in range(len(xheight)):
+    px_bucket[i] = pxs[np.logical_and(xs >= xbin[i], xs < xbin[i+1])].sum()
 plt.bar(height=xheight, x=xbin[:-1], width=w, alpha=.3, label='X')
-plt.plot(xs, pxs)
+plt.plot(xbin[:-1], px_bucket)
 plt.xlabel('x')
 plt.ylabel('p(x)')
 
