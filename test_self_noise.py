@@ -4,40 +4,9 @@
 #%%
 import numpy as np
 import torch
-import matplotlib
 import matplotlib.pyplot as plt
 import scanpy as sc
-import torch.distributions as D
 from celldelta import MLP
-from copy import deepcopy
-#%%
-device = 'cuda:0'
-
-## %%
-# Generate simple test data
-# Initial distribution
-# X0 = torch.randn((1000, 1), device=device)
-# Final distribution is initial distribution plus another normal shifted by +4
-# X1 = torch.randn((1000, 1), device=device)+4
-# X = torch.vstack((X0, X1))
-# %%
-genotype='wildtype'
-dataset = 'net'
-adata = sc.read_h5ad(f'{genotype}_{dataset}.h5ad')
-nmp_cell_mask = adata.obs['cell_type'] == 'NMP'
-gene = 'POU5F1'
-X = adata[:, adata.var_names == gene].X.toarray()
-X = torch.tensor(X, device=device, dtype=torch.float32, requires_grad=True)
-
-#%%
-# Plot the two distributions
-_=plt.hist(X.data.cpu().numpy(), bins=30, alpha=.3, label='X')
-plt.legend()
-
-#%%
-epochs = 500
-n_samples = 1000
-ts = torch.linspace(0, 1, 100, device=device, requires_grad=True)
 
 #%%
 class Model(torch.nn.Module):
@@ -70,7 +39,7 @@ class Model(torch.nn.Module):
             # Save the state
             samples[i] = x0
         samples = samples.reshape((-1, x0.shape[1]))
-        # Randomly pick N points from the samples
+        # Return the last step
         samples = samples[torch.randperm(len(samples))[:len(x0)]] 
         return samples
     
@@ -135,17 +104,38 @@ def nce_loss(x, model, noise):
     return -v, acc
 
 #%%
+device = 'cuda:0'
+
+# %%
+genotype='wildtype'
+dataset = 'net'
+adata = sc.read_h5ad(f'{genotype}_{dataset}.h5ad')
+gene = 'POU5F1'
+X = adata[:, adata.var_names == gene].X.toarray()
+X = torch.tensor(X, device=device, dtype=torch.float32, requires_grad=True)
+
+#%%
+# Plot the two distributions
+_=plt.hist(X.data.cpu().numpy(), bins=30, alpha=.3, label='X')
+plt.legend()
+
+#%%
+epochs = 500
+n_samples = 1000
+ts = torch.linspace(0, 1, 100, device=device, requires_grad=True)
+
+#%%
 # Initialize the model
-model = Model(device)
+model = Model(input_dim=1, hidden_dim=64, layers=3, device=device)
 optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
 l_nces = []
 accs = []
 #%%
 # Train the model
-for i in range(2000):
+for i in range(epochs):
     optimizer.zero_grad()
-    x_eps = np.random.uniform(0, .2)
-    p_eps = np.random.uniform(0, .2)
+    x_eps = .001
+    p_eps = np.random.uniform(0, 1)
     l_nce, acc = self_loss(X, model, p_eps=p_eps, x_eps=x_eps)
     l_nce.backward()
     optimizer.step()
@@ -200,12 +190,13 @@ gene1, gene2 = adata.var_names[top_variance_gene_mask]
 
 # %%
 # Plot the two distributions separately
-fig, axs = plt.subplots(1, 2, figsize=(10,5))
+fig, axs = plt.subplots(3, 1, figsize=(5,15))
 xnp = X.data.cpu().numpy()
 axs[0].hist(xnp[:,0], bins=30, alpha=1)
 axs[1].hist(xnp[:,1], bins=30, alpha=1)
 axs[0].set_title(gene1)
 axs[1].set_title(gene2)
+axs[2].scatter(xnp[:,0], xnp[:,1], alpha=.3, s=1, c='k')
 
 
 # %%
@@ -214,7 +205,6 @@ model = Model(input_dim=2,
               hidden_dim=64,
               layers=2,
               device=device)
-# noise = PerturbationNoise(model, X, ts, perturbation=1e-3)
 optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
 l_nces = []
 accs = []
@@ -222,8 +212,8 @@ accs = []
 # Train the model
 for i in range(2000):
     optimizer.zero_grad()
-    x_eps = np.random.uniform(0, .2)
-    p_eps = np.random.uniform(0, .2)
+    x_eps = np.random.uniform(0, .001)
+    p_eps = np.random.uniform(0, 5)
     l_nce, acc = self_loss(X, model, p_eps=p_eps, x_eps=x_eps)
     l_nce.backward()
     optimizer.step()
@@ -248,16 +238,15 @@ axs[0].set_xlim(x.min(), x.max())
 axs[0].set_ylim(y.min(), y.max())
 axs[1].set_xlim(axs[0].get_xlim())
 axs[1].set_ylim(axs[0].get_ylim())
-axs[0].contourf(xx, yy, log_prob_np.reshape(xx.shape), alpha=.5)
+axs[0].contourf(xx, yy, log_prob_np.reshape(xx.shape), alpha=.5, levels=30)
 # axs[0].scatter(xnp[:,0], xnp[:,1], alpha=.3, s=1, c='k')
 # Count the number of points in each bin
 xheight, xbin, ybin = np.histogram2d(xnp[:,0], xnp[:,1], bins=30)
 xheight = xheight / xheight.sum()
 xheight = xheight+1e-6
-# Plot the contour
-plt.contourf(xbin[:-1], ybin[:-1], np.log(xheight.T), alpha=.5)
+# Plot the contour`
 # plt.scatter(xnp[:,0], xnp[:,1], alpha=.3, s=1, c='k')
-axs[1].contourf(xbin[:-1], ybin[:-1], np.log(xheight.T), alpha=.5)
+axs[1].contourf(xbin[:-1], ybin[:-1], np.log(xheight.T), alpha=.5, levels=30)
 # axs[1].scatter(xnp[:,0], xnp[:,1], alpha=.3, s=1, c='k')
 
 # log_prob = model.log_prob(xs)
@@ -268,27 +257,29 @@ from sklearn.datasets import make_moons
 Xnp, y = make_moons(n_samples=1000, noise=.05)
 X = torch.tensor(Xnp, device=device, dtype=torch.float32, requires_grad=True)
 # Plot the distribution
-plt.scatter(Xnp[:,0], Xnp[:,1], c=y)
+plt.scatter(Xnp[:,0], Xnp[:,1], c=y, s=3, alpha=1)
 # %%
 # Initialize the model
 model = Model(input_dim=2, 
               hidden_dim=64,
               layers=2,
               device=device)
-# noise = PerturbationNoise(model, X, ts, perturbation=1e-3)
 optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
 l_nces = []
 #%%
 # Train the model
-for i in range(2000):
+n_epochs = 2000
+for i in range(n_epochs):
     optimizer.zero_grad()
-    x_eps = np.random.uniform(0, .01)
-    p_eps = np.random.uniform(0, .2)
-    l_nce, _ = self_loss(X, model, p_eps=p_eps, x_eps=x_eps, sample_steps=100)
+    x_eps = .01
+    log_prob = model.log_prob(X)
+    # p_eps should be a small fraction of the log_prob
+    p_eps = torch.abs(log_prob).mean().item()*.1
+    l_nce, _ = self_loss(X, model, p_eps=p_eps, x_eps=x_eps, sample_steps=10)
     l_nce.backward()
     optimizer.step()
     l_nces.append(l_nce.item())
-    print(f'epoch {i}: l_nce={l_nce.item():.4f}')
+    print(f'epoch {i}: l_nce={l_nce.item():.4f}, p_eps={p_eps:.4f}')
 
 # %%
 # Plot contours of log probability
@@ -318,4 +309,70 @@ xheight = xheight+1e-6
 plt.contourf(xbin[:-1], ybin[:-1], np.log(xheight.T), alpha=.5)
 plt.scatter(Xnp[:,0], Xnp[:,1], alpha=.3, s=1, c='k')
 
+# %%
+# Test if the model can learn the distribution of the NMP cell type versus the rest
+# of the cell types in the single cell data with all the genes
+Xnp = adata.X.toarray()
+X = torch.tensor(Xnp, device=device, dtype=torch.float32, requires_grad=True)
+nmp_cell_mask = adata.obs['cell_type'] == 'NMP'
+Xnmp = X[nmp_cell_mask].detach()
+# %%
+# Calculate the PCA projection of the data
+from sklearn.decomposition import PCA
+pca = PCA()
+pca.components_ = adata.uns['PCs']
+pca.mean_ = adata.uns['pca_mean']
+Xpca = pca.transform(Xnp)
+Xnmp_pca = pca.transform(Xnmp.cpu().detach().numpy())
+plt.scatter(Xpca[:,0], Xpca[:,1], alpha=.3, s=1, c='k')
+plt.scatter(Xnmp_pca[:,0], Xnmp_pca[:,1], alpha=.3, s=1, c='r')
+# Calculate a contour plot in 2d PCA space of the NMP cells
+# Make a meshgrid of the axes
+xnmp_height, xbin, ybin = np.histogram2d(Xnmp_pca[:,0], Xnmp_pca[:,1], bins=30, 
+                                         range=[[Xpca[:,0].min(), Xpca[:,0].max()], 
+                                                [Xpca[:,1].min(), Xpca[:,1].max()]])
+plt.contourf(xbin[:-1], ybin[:-1], np.log(xnmp_height.T+1e-6), alpha=.5)
+#%%
+# Initialize the model
+model = Model(input_dim=X.shape[1], 
+              hidden_dim=256,
+              layers=2,
+              device=device)
+optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+l_nces = []
+#%%
+# Train the model
+for i in range(1000):
+    optimizer.zero_grad()
+    x_eps = np.random.uniform(0, .01)
+    p_eps = np.random.uniform(0, .2)
+    l_nce, _ = self_loss(Xnmp, model, p_eps=p_eps, x_eps=x_eps, sample_steps=10)
+    l_nce.backward()
+    optimizer.step()
+    l_nces.append(l_nce.item())
+    print(f'epoch {i}: l_nce={l_nce.item():.4f}')
+# %%
+# Scatter plot of the data with cells colored by log probability
+log_prob = model.log_prob(X)
+log_prob_np = log_prob.cpu().detach().numpy()
+# Get the middle 99% of the log probabilities
+qnt = np.quantile(log_prob_np, [.005, .995])
+qnt_mask = np.logical_and(log_prob_np > qnt[0], log_prob_np < qnt[1]).flatten()
+log_prob_mid = log_prob_np[qnt_mask]
+prob_np = torch.exp(log_prob - torch.logsumexp(log_prob, dim=0)).detach().cpu().numpy()
+plt.scatter(Xpca[qnt_mask,0], Xpca[qnt_mask,1], alpha=.3, s=1, c=log_prob_mid)
+# %%
+plt.hist(log_prob_np, density=True, bins=100, alpha=.3, label='All cells')
+plt.hist(model.log_prob(Xnmp).detach().cpu().numpy(), 
+         density=True, bins=100, alpha=.3, label='NMP cells');
+plt.legend()
+# %%
+# Get the top N cells by probability, where N=number of NMP cells
+# Check if the NMP cells are in the top N
+nmp_count = np.sum(nmp_cell_mask)
+top_n = np.argsort(log_prob_np.flatten())[-nmp_count:]
+# Get the cell type of the top N cells
+top_n_cell_type = adata.obs['cell_type'][top_n]
+# Print the cell types counts of the top N cells
+print(top_n_cell_type.value_counts())
 # %%
