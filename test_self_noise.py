@@ -7,6 +7,7 @@ import torch
 import matplotlib.pyplot as plt
 import scanpy as sc
 from celldelta import MLP
+import copy
 
 #%%
 class Model(torch.nn.Module):
@@ -19,29 +20,25 @@ class Model(torch.nn.Module):
         """
         MCMC sampling of the model
         """
-        samples = torch.zeros((n_steps, x0.shape[0], x0.shape[1]), device=self.device)
-        for i in range(n_steps):
-            # Sample from a normal distribution centered at
-            # the current state
-            d = torch.randn_like(x0)*step_size
-            # Add the delta to the current state
-            x0 = x0 + d
-            # Calculate the acceptance probability
-            p0 = self.log_prob(x0)
-            p1 = self.log_prob(x0 + d)
-            if eps is not None:
-                p0 += eps
-                p1 += eps
-            # Accept or reject the new state
-            accept = torch.rand_like(p0) < torch.exp(p1 - p0)
-            # Update the state
-            x0 = torch.where(accept, x0+d, x0)
-            # Save the state
-            samples[i] = x0
-        samples = samples.reshape((-1, x0.shape[1]))
-        # Return the last step
-        samples = samples[torch.randperm(len(samples))[:len(x0)]] 
-        return samples
+        with torch.no_grad():
+            for i in range(n_steps):
+                # Sample from a normal distribution centered at
+                # the current state
+                d = torch.randn_like(x0)*step_size
+                # Add the delta to the current state
+                x0 = x0 + d
+                # Calculate the acceptance probability
+                p0 = self.log_prob(x0)
+                p1 = self.log_prob(x0 + d)
+                if eps is not None:
+                    p0 += eps
+                    p1 += eps
+                # Accept or reject the new state
+                accept = torch.rand_like(p0) < torch.exp(p1 - p0)
+                # Update the state
+                x0 = torch.where(accept, x0+d, x0)
+                # Save the state
+            return x0   
     
     def ux(self, x):
         """
@@ -59,26 +56,28 @@ class Model(torch.nn.Module):
         return self.nn(x)
 
 #%%
-def self_loss(x, model, p_eps, x_eps, sample_steps=10):
-    eps = torch.ones_like(x)*np.log(p_eps)
+def self_loss(x, model, p_eps, mcmc_step, sample_steps=10):
+    logp_x = model.log_prob(x) # logp(x) 
 
-    y = model.sample(x, n_steps=sample_steps, step_size=x_eps, eps=p_eps) # y ~ q(y|x)
-    
-    logp_x = model.log_prob(x) # logp(x)
+    # p_eps should be a small fraction of the log_prob
+    # TODO make sure the math is correct here, we actually want to use a fraction of the 
+    # TODO prob itself, not the log prob? Or at least correct for the log conversion somehow?
+    # eps = torch.abs(logp_x).mean().item()*np.log(p_eps)
+    eps_ = torch.ones_like(x)*np.log(p_eps)
+
+    y = model.sample(x, n_steps=sample_steps, step_size=mcmc_step, eps=p_eps) # y ~ q(y|x)
     logp_y = model.log_prob(y) # logp(y)
-    # logq_x = logp_x + eps # logq(x)
-    # logq_y = logp_y + eps # logq(y)
+
+    # x_eps = -torch.abs(torch.ones_like(x)*np.log(p_eps))# * logp_x).detach()
+    # y_eps = -torch.abs(torch.ones_like(x)*np.log(p_eps))# * logp_y).detach()
 
     l2 = np.log(2)
-    lx = logp_x - torch.logaddexp(l2 + logp_x, eps)  # logp(x)/(log(2p(x)) + ε)
-    ly = logp_x - torch.logaddexp(l2 + logp_y, eps)  # logp(x)/(log(2p(y)) + ε)
-    leps = eps - torch.logaddexp(l2 + logp_y, eps)  # log(ε)/(log(2p(y)) + ε)
-    # r_x = torch.sigmoid(logp_x - logq_x)
-    # r_y = torch.sigmoid(logq_y - logp_y)
-    # acc = ((r_x > 1/2).sum() + (r_y > 1/2).sum()).cpu().numpy() / (len(x) + len(y))
-
+    lx = logp_x - torch.logaddexp(l2 + logp_x, eps_)  # log(p(x)/(2p(x) + ε))
+    ly = logp_y - torch.logaddexp(l2 + logp_y, eps_)  # log(p(y)/(2p(y) + ε))
+    leps = eps_ - torch.logaddexp(l2 + logp_y, eps_)  # log(ε/(2p(x) + ε))
     loss = lx.mean() + ly.mean() + leps.mean()
-    return -loss, 0
+
+    return lx, ly, 0, -loss
 
 #%%
 def nce_loss(x, model, noise):
@@ -132,16 +131,27 @@ l_nces = []
 accs = []
 #%%
 # Train the model
-for i in range(epochs):
+for i in range(500):
     optimizer.zero_grad()
-    x_eps = .001
-    p_eps = np.random.uniform(0, 1)
-    l_nce, acc = self_loss(X, model, p_eps=p_eps, x_eps=x_eps)
+    mcmc_step = .01
+    p_eps = .001
+    lx, ly, _, l_nce = self_loss(X, model, p_eps=p_eps, mcmc_step=mcmc_step, sample_steps=1)
     l_nce.backward()
     optimizer.step()
     l_nces.append(l_nce.item())
-    accs.append(acc)
-    print(f'epoch {i}: l_nce={l_nce.item():.4f} acc={acc:.4f}')
+    print(f'epoch {i}: l_nce={l_nce.item():.4f}, lx={lx.mean().item():.4f}, ly={ly.mean().item()}')
+#     # Save the state dict of the model with minimum loss
+#     if l_nce.item() == min(l_nces):
+#         best_model = copy.deepcopy(model.state_dict())
+    
+#     # Break if the loss exceeds two times the minimum loss
+#     if l_nce.item() > 2*min(l_nces):
+#         break
+
+#     print(f'epoch {i}: l_nce={l_nce.item():.4f} acc={acc:.4f}')
+
+# model.load_state_dict(best_model)
+# print('Best loss: ', min(l_nces))
 
 #%%
 fig, axs = plt.subplots(2, 1, figsize=(10,10))
@@ -210,16 +220,27 @@ l_nces = []
 accs = []
 #%%
 # Train the model
-for i in range(2000):
+for i in range(1500):
     optimizer.zero_grad()
-    x_eps = np.random.uniform(0, .001)
-    p_eps = np.random.uniform(0, 5)
-    l_nce, acc = self_loss(X, model, p_eps=p_eps, x_eps=x_eps)
+    mcmc_step = np.random.uniform(0, .05)
+    p_eps = .01
+    lx, ly, _, l_nce = self_loss(X, model, p_eps=p_eps, mcmc_step=mcmc_step, sample_steps=1)
     l_nce.backward()
     optimizer.step()
     l_nces.append(l_nce.item())
-    accs.append(acc)
-    print(f'epoch {i}: l_nce={l_nce.item():.4f} acc={acc:.4f}')
+    print(f'epoch {i}: l_nce={l_nce.item():.4f}, lx={lx.mean().item():.4f}, ly={ly.mean().item()}')
+
+    # Save the state dict of the model with minimum loss
+#     if l_nce.item() == min(l_nces):
+#         best_model = copy.deepcopy(model.state_dict())
+    
+#     # Break if the loss exceeds two times the minimum loss
+#     if l_nce.item() > 2*min(l_nces):
+#         break
+
+# model.load_state_dict(best_model)
+print('Best loss: ', min(l_nces))
+
 # %%
 # Plot contours of log probability
 # Make a meshgrid of the axes
@@ -228,7 +249,7 @@ y = np.linspace(xnp.min(), xnp.max(), 200)
 xx, yy = np.meshgrid(x, y)
 # Get the log_prob of every x,y pair
 xy = torch.tensor(np.vstack((xx.flatten(), yy.flatten())).T, device=device, dtype=torch.float32)
-log_prob = model.log_prob(xy)
+log_prob = -model.log_prob(xy)
 # Normalize the log_probs
 log_prob = log_prob - torch.logsumexp(log_prob, dim=0)
 log_prob_np = log_prob.cpu().detach().numpy()
@@ -268,18 +289,26 @@ optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
 l_nces = []
 #%%
 # Train the model
-n_epochs = 2000
+n_epochs = 1000
 for i in range(n_epochs):
     optimizer.zero_grad()
-    x_eps = .01
-    log_prob = model.log_prob(X)
-    # p_eps should be a small fraction of the log_prob
-    p_eps = torch.abs(log_prob).mean().item()*.1
-    l_nce, _ = self_loss(X, model, p_eps=p_eps, x_eps=x_eps, sample_steps=10)
+    mcmc_step = .1
+    p_eps = .01
+    lx, ly, _, l_nce = self_loss(X, model, p_eps=p_eps, mcmc_step=mcmc_step, sample_steps=1)
     l_nce.backward()
     optimizer.step()
     l_nces.append(l_nce.item())
-    print(f'epoch {i}: l_nce={l_nce.item():.4f}, p_eps={p_eps:.4f}')
+    print(f'epoch {i}: l_nce={l_nce.item():.4f}, lx={lx.mean().item():.4f}, ly={ly.mean().item()}')
+    # Save the state dict of the model with minimum loss
+#     if l_nce.item() == min(l_nces):
+#         best_model = copy.deepcopy(model.state_dict())
+    
+#     # Break if the loss exceeds two times the minimum loss
+#     if l_nce.item() > 2*min(l_nces):
+#         break
+    
+# model.load_state_dict(best_model)
+# print('Best loss: ', min(l_nces))
 
 # %%
 # Plot contours of log probability
@@ -300,14 +329,17 @@ axs[0].set_ylim(y.min(), y.max())
 axs[1].set_xlim(axs[0].get_xlim())
 axs[1].set_ylim(axs[0].get_ylim())
 axs[0].contourf(xx, yy, np.exp(log_prob_np.reshape(xx.shape)), alpha=.5, levels=30)
-axs[0].scatter(Xnp[:,0], Xnp[:,1], alpha=.3, s=1, c='k')
+# axs[0].scatter(Xnp[:,0], Xnp[:,1], alpha=.3, s=1, c='k')
 # Count the number of points in each bin
-xheight, xbin, ybin = np.histogram2d(Xnp[:,0], Xnp[:,1], bins=30)
+xheight, xbin, ybin = np.histogram2d(Xnp[:,0], Xnp[:,1], 
+                                    range=[[x.min(), x.max()], 
+                                           [y.min(), y.max()]],
+                                    bins=50)
 xheight = xheight / xheight.sum()
 xheight = xheight+1e-6
 # Plot the contour
-plt.contourf(xbin[:-1], ybin[:-1], np.log(xheight.T), alpha=.5)
-plt.scatter(Xnp[:,0], Xnp[:,1], alpha=.3, s=1, c='k')
+axs[1].contourf(xbin[:-1], ybin[:-1], np.log(xheight.T+1e-8), alpha=.5, levels=15)
+axs[1].scatter(Xnp[:,0], Xnp[:,1], alpha=.3, s=1, c='k')
 
 # %%
 # Test if the model can learn the distribution of the NMP cell type versus the rest
@@ -344,16 +376,27 @@ l_nces = []
 # Train the model
 for i in range(1000):
     optimizer.zero_grad()
-    x_eps = np.random.uniform(0, .01)
-    p_eps = np.random.uniform(0, .2)
-    l_nce, _ = self_loss(Xnmp, model, p_eps=p_eps, x_eps=x_eps, sample_steps=10)
+    mcmc_step = .5
+    p_eps = .1
+    lx, ly, _, l_nce = self_loss(Xnmp, model, p_eps=p_eps, mcmc_step=mcmc_step, sample_steps=1)
     l_nce.backward()
     optimizer.step()
     l_nces.append(l_nce.item())
-    print(f'epoch {i}: l_nce={l_nce.item():.4f}')
+    print(f'epoch {i}: l_nce={l_nce.item():.4f}, lx={lx.mean().item():.4f}, ly={ly.mean().item()}')
+    
+#      # Save the state dict of the model with minimum loss
+#     if l_nce.item() == min(l_nces):
+#         best_model = copy.deepcopy(model.state_dict())
+    
+#     # Break if the loss exceeds two times the minimum loss
+#     if l_nce.item() > 2*min(l_nces):
+#         break
+
+# model.load_state_dict(best_model)
+# print('Best loss: ', np.argmin(l_nces), min(l_nces))
 # %%
 # Scatter plot of the data with cells colored by log probability
-log_prob = model.log_prob(X)
+log_prob = -model.log_prob(X)
 log_prob_np = log_prob.cpu().detach().numpy()
 # Get the middle 99% of the log probabilities
 qnt = np.quantile(log_prob_np, [.005, .995])
@@ -374,5 +417,7 @@ top_n = np.argsort(log_prob_np.flatten())[-nmp_count:]
 # Get the cell type of the top N cells
 top_n_cell_type = adata.obs['cell_type'][top_n]
 # Print the cell types counts of the top N cells
-print(top_n_cell_type.value_counts())
+# Add a column with the percentage of each cell type in the top N
+top_n_cell_pct = top_n_cell_type.value_counts() / nmp_count
+print(top_n_cell_type.value_counts().to_frame().join(top_n_cell_pct.to_frame(), rsuffix='_pct'))
 # %%
