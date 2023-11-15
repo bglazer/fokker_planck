@@ -8,8 +8,7 @@ import matplotlib
 import matplotlib.pyplot as plt
 import scanpy as sc
 import torch.distributions as D
-from celldelta import CellDelta, SelfNoise
-
+from celldelta import CellDelta
 #%%
 device = 'cuda:0'
 
@@ -52,27 +51,25 @@ ux_dropout = 0
 pxt_dropout = 0
 
 celldelta = CellDelta(input_dim=1, device=device,
-                      ux_hidden_dim=64, ux_layers=2, ux_dropout=ux_dropout,
-                      pxt_hidden_dim=64, pxt_layers=2, pxt_dropout=pxt_dropout,
-                      normalize_gradient=True, loss_type='nce')
-# noise = SelfNoise(celldelta=celldelta, ts=ts)
-noise = D.MultivariateNormal(loc=torch.ones(1, device=device)*2, 
-                             covariance_matrix=torch.eye(1, device=device)*6)
+                      ux_hidden_dim=64, ux_layers=2, 
+                      pxt_hidden_dim=64, pxt_layers=2)
+
 #%%
 # Train the model
-losses = celldelta.optimize(X, X0, ts, noise=noise, restart=True, pxt_lr=1e-3, ux_lr=1e-3, 
+losses = celldelta.optimize(X, X0, ts,
+                            pxt_lr=1e-3, ux_lr=1e-3, 
                             alpha_fp=1, n_epochs=epochs, n_samples=n_samples, 
-                            ratio_clip=None, verbose=True)
+                            verbose=True)
 
 #%%
 l_fps = losses['l_fp']
-l_nce_pxs = losses['l_nce_px']
-l_nce_p0s = losses['l_nce_p0']
+l_self_pxs = losses['l_self_px']
+l_self_p0s = losses['l_self_p0']
 
 fig, axs = plt.subplots(3, 1, figsize=(10,10))
 axs[0].plot(l_fps[10:], label='l_fp')
-axs[1].plot(l_nce_pxs[10:], label='l_nce_pxs')
-axs[2].plot(l_nce_p0s[10:], label='l_nce_p0')
+axs[1].plot(l_self_pxs[10:], label='l_self_pxs')
+axs[2].plot(l_self_p0s[10:], label='l_self_p0')
 [axs[i].set_xlabel('Epoch') for i in range(len(axs))]
 [axs[i].set_ylabel('Loss') for i in range(len(axs))]
 [axs[i].legend() for i in range(len(axs))]
@@ -87,7 +84,7 @@ low = float(X.min())
 high = float(X.max())
 l = low-.25*(high-low) 
 h = high+.25*(high-low)
-xs = torch.arange(l, h, .01, device=device)[:,None]
+xs = torch.arange(0, h, .01, device=device)[:,None]
 
 pxts = torch.exp(celldelta.pxt(xs, ts)).squeeze().T.cpu().detach().numpy()
 uxs = celldelta.ux(xs).squeeze().cpu().detach().numpy()
@@ -226,4 +223,7 @@ w = sim_mean_bins[1] - sim_mean_bins[0]
 plt.bar(sim_mean_bins[:-1], sim_mean_dist, width=w, alpha=.3, label='Simulation')
 
 plt.bar(data_bins[:-1], data_dist, width=w, alpha=.3, label='Data')
+plt.ylabel('p(x)')
+plt.xlabel(f'Expression {gene}')
+plt.legend();
 # %%

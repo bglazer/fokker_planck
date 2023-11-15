@@ -56,46 +56,37 @@ class Model(torch.nn.Module):
         return self.nn(x)
 
 #%%
-def self_loss(x, model, p_eps, mcmc_step, sample_steps=10):
+# def self_loss(x, model, p_eps, mcmc_step, sample_steps=10):
+#     logp_x = model.log_prob(x) # logp(x) 
+
+#     y = model.sample(x, n_steps=sample_steps, step_size=mcmc_step, eps=None) # y ~ q(y|x)
+#     logp_y = model.log_prob(y) # logp(y)
+
+#     x_eps = -(torch.abs(torch.ones_like(x)*np.log(p_eps)) * logp_x).detach()
+#     y_eps = -(torch.abs(torch.ones_like(x)*np.log(p_eps)) * logp_y).detach()
+
+#     l2 = np.log(2)
+#     lx = logp_x - torch.logaddexp(l2 + logp_x, x_eps)  # log(p(x)/(2p(x) + ε))
+#     ly = logp_y - torch.logaddexp(l2 + logp_y, y_eps)  # log(p(y)/(2p(y) + ε))
+#     leps = y_eps - torch.logaddexp(l2 + logp_y, y_eps)  # log(ε/(2p(y) + ε))
+#     loss = lx.mean() + leps.mean() + ly.mean()
+
+#     return lx, ly, leps, -loss
+
+def self_loss(x, model, mcmc_step, sample_steps=10):
     logp_x = model.log_prob(x) # logp(x) 
 
-    y = model.sample(x, n_steps=sample_steps, step_size=mcmc_step, eps=p_eps) # y ~ q(y|x)
+    y = model.sample(x, n_steps=sample_steps, step_size=mcmc_step, eps=None) # y ~ q(y|x)
     logp_y = model.log_prob(y) # logp(y)
 
-    x_eps = -(torch.abs(torch.ones_like(x)*np.log(p_eps)) * logp_x).detach()
-    y_eps = -(torch.abs(torch.ones_like(x)*np.log(p_eps)) * logp_y).detach()
+    zero = torch.zeros(1, device=x.device)
 
-    l2 = np.log(2)
-    lx = logp_x - torch.logaddexp(l2 + logp_x, x_eps)  # log(p(x)/(2p(x) + ε))
-    ly = logp_y - torch.logaddexp(l2 + logp_y, y_eps)  # log(p(y)/(2p(y) + ε))
-    # ly = torch.logaddexp(logp_y, y_eps) - torch.logaddexp(l2 + logp_y, y_eps)  # log(p(y)/(2p(y) + ε))
-    leps = y_eps - torch.logaddexp(l2 + logp_y, y_eps)  # log(ε/(2p(x) + ε))
-    loss = lx.mean() + ly.mean() + leps.mean()
+    lx = logp_x - torch.logaddexp(logp_x, zero)  # log(p(x)/(2p(x) + ε))
+    ly = logp_y - torch.logaddexp(logp_y, zero)  # log(p(y)/(2p(y) + ε))
+    leps = - torch.logaddexp(logp_y, zero)  # log(ε/(2p(y) + ε))
+    loss = lx.mean() + leps.mean() + ly.mean()
 
     return lx, ly, leps, -loss
-
-#%%
-def nce_loss(x, model, noise):
-    y = noise.sample(x.shape[0])
-
-    logp_x = model.log_prob(x) # logp(x)
-    logq_x = noise.log_prob(x) # logq(x)
-    logp_y = model.log_prob(y) # logp(y)
-    logq_y = noise.log_prob(y) # logq(y)
-
-    value_x = logp_x - torch.logaddexp(logp_x, logq_x)  # logp(x)/(logp(x) + logq(x))
-    value_y = logq_y - torch.logaddexp(logp_y, logq_y)  # logq(y)/(logp(y) + logq(y))
-
-    v = value_x.mean() + value_y.mean()
-
-    # Classification of noise vs target
-    r_x = torch.sigmoid(logp_x - logq_x)
-    r_y = torch.sigmoid(logq_y - logp_y)
-
-    # Compute the classification accuracy
-    acc = ((r_x > 1/2).sum() + (r_y > 1/2).sum()).cpu().numpy() / (len(x) + len(y))
-    
-    return -v, acc
 
 #%%
 device = 'cuda:0'
@@ -107,30 +98,29 @@ adata = sc.read_h5ad(f'{genotype}_{dataset}.h5ad')
 gene = 'POU5F1'
 X = adata[:, adata.var_names == gene].X.toarray()
 X = torch.tensor(X, device=device, dtype=torch.float32, requires_grad=True)
-
+Xnmp = adata[adata.obs['cell_type'] == 'NMP', adata.var_names == gene].X.toarray()
+Xnmp = torch.tensor(Xnmp, device=device, dtype=torch.float32, requires_grad=True)
+X = Xnmp
 #%%
-# Plot the two distributions
+# Plot the distribution
 _=plt.hist(X.data.cpu().numpy(), bins=30, alpha=.3, label='X')
 plt.legend()
 
 #%%
 epochs = 500
 n_samples = 1000
-ts = torch.linspace(0, 1, 100, device=device, requires_grad=True)
 
 #%%
 # Initialize the model
 model = Model(input_dim=1, hidden_dim=64, layers=3, device=device)
 optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
 l_nces = []
-accs = []
 #%%
 # Train the model
 for i in range(500):
     optimizer.zero_grad()
-    mcmc_step = .8
-    p_eps = .1
-    lx, ly, _, l_nce = self_loss(X, model, p_eps=p_eps, mcmc_step=mcmc_step, sample_steps=1)
+    mcmc_step = .25
+    lx, ly, leps, l_nce = self_loss(Xnmp, model, mcmc_step=mcmc_step, sample_steps=1)
     l_nce.backward()
     optimizer.step()
     l_nces.append(l_nce.item())
@@ -138,12 +128,11 @@ for i in range(500):
 
 
 #%%
-fig, axs = plt.subplots(2, 1, figsize=(10,10))
-axs[0].plot(l_nces[10:], label='l_nce')
-axs[1].plot(accs[10:], label='accuracy')
-[axs[i].set_xlabel('Epoch') for i in range(len(axs))]
-[axs[i].set_ylabel('Loss') for i in range(len(axs))]
-[axs[i].legend() for i in range(len(axs))]
+fig, axs = plt.subplots(1, 1, figsize=(10,5))
+axs.plot(l_nces[10:], label='l_self')
+axs.set_xlabel('Epoch')
+axs.set_ylabel('Loss')
+axs.legend()
 fig.suptitle('Loss curves')
 fig.tight_layout()
 
@@ -184,14 +173,13 @@ gene1, gene2 = adata.var_names[top_variance_gene_mask]
 
 # %%
 # Plot the two distributions separately
-fig, axs = plt.subplots(3, 1, figsize=(5,15))
+fig, axs = plt.subplots(3, 1, figsize=(5,10))
 xnp = X.data.cpu().numpy()
 axs[0].hist(xnp[:,0], bins=30, alpha=1)
 axs[1].hist(xnp[:,1], bins=30, alpha=1)
 axs[0].set_title(gene1)
 axs[1].set_title(gene2)
 axs[2].scatter(xnp[:,0], xnp[:,1], alpha=.3, s=1, c='k')
-
 
 # %%
 # Initialize the model
@@ -206,9 +194,8 @@ accs = []
 # Train the model
 for i in range(1500):
     optimizer.zero_grad()
-    mcmc_step = np.random.uniform(0, .5)
-    p_eps = .01
-    lx, ly, leps, l_nce = self_loss(X, model, p_eps=p_eps, mcmc_step=mcmc_step, sample_steps=1)
+    mcmc_step = .5
+    lx, ly, leps, l_nce = self_loss(X, model, mcmc_step=mcmc_step, sample_steps=1)
     l_nce.backward()
     optimizer.step()
     l_nces.append(l_nce.item())
@@ -218,8 +205,8 @@ for i in range(1500):
 # %%
 # Plot contours of log probability
 # Make a meshgrid of the axes
-x = np.linspace(xnp.min()-.2, xnp.max(), 200)
-y = np.linspace(xnp.min()-.2, xnp.max(), 200)
+x = np.linspace(xnp.min(), xnp.max(), 200)
+y = np.linspace(xnp.min(), xnp.max(), 200)
 xx, yy = np.meshgrid(x, y)
 # Get the log_prob of every x,y pair
 xy = torch.tensor(np.vstack((xx.flatten(), yy.flatten())).T, device=device, dtype=torch.float32)
@@ -269,13 +256,14 @@ l_nces = []
 n_epochs = 1000
 for i in range(n_epochs):
     optimizer.zero_grad()
-    mcmc_step = np.random.uniform(0, .5)
-    p_eps = .01
-    lx, ly, leps, l_nce = self_loss(X, model, p_eps=p_eps, mcmc_step=mcmc_step, sample_steps=1)
+    mcmc_step = .5
+    lx, ly,_, l_nce = self_loss(X, model=model, mcmc_step=mcmc_step, sample_steps=1)
     l_nce.backward()
     optimizer.step()
     l_nces.append(l_nce.item())
-    print(f'epoch {i}: l_nce={l_nce.item():.4f}, lx={lx.mean().item():.4f}, ly={ly.mean().item()}, leps={leps.mean().item()}')
+    print(f'epoch {i}: l_nce={l_nce.item():.4f}, lx={lx.mean().item():.4f}, ly={ly.mean().item()} leps={leps.mean().item()}')
+#%%
+plt.plot(l_nces)
 
 # %%
 # Plot contours of log probability
@@ -295,7 +283,8 @@ axs[0].set_xlim(x.min(), x.max())
 axs[0].set_ylim(y.min(), y.max())
 axs[1].set_xlim(axs[0].get_xlim())
 axs[1].set_ylim(axs[0].get_ylim())
-axs[0].contourf(xx, yy, np.exp(log_prob_np.reshape(xx.shape)), alpha=.5, levels=30)
+# axs[0].contourf(xx, yy, np.exp(log_prob_np.reshape(xx.shape)), alpha=.5, levels=30)
+axs[0].contourf(xx, yy, log_prob_np.reshape(xx.shape), alpha=.5, levels=30)
 # axs[0].scatter(Xnp[:,0], Xnp[:,1], alpha=.3, s=1, c='k')
 # Count the number of points in each bin
 xheight, xbin, ybin = np.histogram2d(Xnp[:,0], Xnp[:,1], 
@@ -307,7 +296,6 @@ xheight = xheight+1e-6
 # Plot the contour
 axs[1].contourf(xbin[:-1], ybin[:-1], np.log(xheight.T+1e-8), alpha=.5, levels=15)
 axs[1].scatter(Xnp[:,0], Xnp[:,1], alpha=.3, s=1, c='k')
-
 
 # %%
 # Test if the model can learn the distribution of the NMP cell type versus the rest
@@ -345,8 +333,7 @@ l_nces = []
 for i in range(1000):
     optimizer.zero_grad()
     mcmc_step = .5
-    p_eps = .01
-    lx, ly, _, l_nce = self_loss(Xnmp, model, p_eps=p_eps, mcmc_step=mcmc_step, sample_steps=1)
+    lx, ly, _, l_nce = self_loss(Xnmp, model, mcmc_step=mcmc_step, sample_steps=1)
     l_nce.backward()
     optimizer.step()
     l_nces.append(l_nce.item())
@@ -370,6 +357,65 @@ plt.legend()
 # %%
 # Get the top N cells by probability, where N=number of NMP cells
 # Check if the NMP cells are in the top N
+nmp_count = np.sum(nmp_cell_mask)
+top_n = np.argsort(log_prob_np.flatten())[-nmp_count:]
+# Get the cell type of the top N cells
+top_n_cell_type = adata.obs['cell_type'][top_n]
+# Print the cell types counts of the top N cells
+# Add a column with the percentage of each cell type in the top N
+top_n_cell_pct = top_n_cell_type.value_counts() / nmp_count
+print(top_n_cell_type.value_counts().to_frame().join(top_n_cell_pct.to_frame(), rsuffix='_pct'))
+# %%
+# Compare performance to using NCE loss
+#%%
+def nce_loss(x, model, noise):
+    y = noise.sample((x.shape[0],)).to(x.device).detach()
+
+    logp_x = model.log_prob(x).flatten() # logp(x)
+    logq_x = noise.log_prob(x).detach() # logq(x)
+    logp_y = model.log_prob(y).flatten() # logp(y)
+    logq_y = noise.log_prob(y).detach() # logq(y)
+
+    value_x = logp_x - torch.logaddexp(logp_x, logq_x)  # logp(x)/(logp(x) + logq(x))
+    value_y = logq_y - torch.logaddexp(logp_y, logq_y)  # logq(y)/(logp(y) + logq(y))
+
+    v = value_x.mean() + value_y.mean()
+
+    # Classification of noise vs target
+    r_x = torch.sigmoid(logp_x - logq_x)
+    r_y = torch.sigmoid(logq_y - logp_y)
+
+    # Compute the classification accuracy
+    acc = ((r_x > 1/2).sum() + (r_y > 1/2).sum()).cpu().numpy() / (len(x) + len(y))
+    
+    return -v, acc
+#%%
+# Use a Gaussian noise distribution, with covariance and mean estimated from the data
+cov = torch.cov(X.T)
+noise = torch.distributions.MultivariateNormal(loc=Xnmp.mean(dim=0), 
+                                               covariance_matrix=cov)
+
+#%%
+# Initialize the model
+model = Model(input_dim=X.shape[1], 
+              hidden_dim=256,
+              layers=2,
+              device=device)
+optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+l_nces = []
+
+#%%
+# Train the model
+for i in range(2500):
+    optimizer.zero_grad()
+    l_nce, acc = nce_loss(Xnmp, model, noise)
+    l_nce.backward()
+    optimizer.step()
+    l_nces.append(l_nce.item())
+    print(f'epoch {i}: l_nce={l_nce.item():.4f}, acc={acc:.4f}')
+# %%
+log_prob = model.log_prob(X)
+log_prob_np = log_prob.cpu().detach().numpy()
 nmp_count = np.sum(nmp_cell_mask)
 top_n = np.argsort(log_prob_np.flatten())[-nmp_count:]
 # Get the cell type of the top N cells
