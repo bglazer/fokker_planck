@@ -3,7 +3,11 @@ from torch import logsumexp
 from torch.nn import Linear, ReLU
 import torch.nn as nn
 import numpy as np
-
+from scipy.stats import gaussian_kde
+from KDE import GaussianKDE
+from copulas.multivariate.gaussian import GaussianMultivariate
+from torch.distributions import Categorical
+from copy import deepcopy
 #%%
 # Define models 
 
@@ -181,16 +185,236 @@ class Pxt(torch.nn.Module):
         # The :-1 is to get the gradient with respect to x
         # The -1 is to get the gradient with respect to t
         return dpdx[:,:,:-1], dpdx[:,:,-1].unsqueeze(2)
+    
+    def sample(self, x0, n_steps, step_size, eps=None):
+        """
+        MCMC sampling of the model
+        """
+        samples = torch.zeros((n_steps, x0.shape[0], x0.shape[1]), device=x0.device)
+        for i in range(n_steps):
+            # Sample from a normal distribution centered at
+            # the current state
+            d = torch.randn_like(x0)*step_size
+            # Add the delta to the current state
+            x0 = x0 + d
+            # Calculate the acceptance probability
+            p0 = self.log_prob(x0)
+            p1 = self.log_prob(x0 + d)
+            # Perturb the log probability if the eps parameter is given
+            if eps is not None:
+                p0 += eps
+                p1 += eps
+            # Accept or reject the new state
+            accept = torch.rand_like(p0) < torch.exp(p1 - p0)
+            # Update the state
+            x0 = torch.where(accept, x0+d, x0)
+            # Save the state
+            samples[i] = x0
+        samples = samples.reshape((-1, x0.shape[1]))
+        # Randomly pick N points from the samples
+        samples = samples[torch.randperm(len(samples))[:len(x0)]] 
+        return samples
 
-class SelfNoise(torch.nn.Module):
+class KDENoise():
+    """
+    Noise distribution with a kernel density estimator
+    """
+    def __init__(self, X, bandwidth=None, chunk_size=None):
+        self.bandwidth = bandwidth
+        # self.kde = GaussianKDE(X, bw=.1, chunk_size=chunk_size)
+        self.kde = gaussian_kde(X.T.data.cpu(), bw_method=bandwidth)
+        self.device = X.device
+
+    def sample(self, n_samples):
+        return torch.tensor(self.kde.resample(n_samples).T, dtype=torch.float32, device=self.device)
+        # return self.kde.sample(n_samples)
+
+    def log_prob(self, x):
+        return torch.tensor(self.kde.logpdf(x.T.data.cpu()), dtype=torch.float32, device=self.device)
+        # return self.kde.log_prob(x)
+
+class CopulaNoise():
+    """
+    Noise distribution from a Gaussian Copula
+    """
+    def __init__(self, X):
+        self.copula = GaussianMultivariate()
+        self.copula.fit(X=X.data.cpu().numpy())
+        self.device = X.device
+
+    def sample(self, n_samples):
+        return torch.tensor(self.copula.sample(n_samples).to_numpy(), dtype=torch.float32, device=self.device)
+
+    # def sample(self, n_samples):
+    #     rand_idxs = torch.randperm(len(self.sample))[:n_samples]
+    #     return self.sample[rand_idxs,:].to(self.device)
+
+    def log_prob(self, x):
+        return torch.tensor(self.copula.log_probability_density(x.data.cpu()), dtype=torch.float32, device=self.device)
+    
+class IndependentKDENoise():
+    """
+    Simple noise distribution that assumes each gene is independent
+    """
+    def __init__(self, X):
+        self.X = X
+        self.device = X.device
+        # For each gene, compute a Gaussian KDE
+        self.kdes = []
+        for i in range(X.shape[1]):
+            kde = gaussian_kde(X[:,i].data.cpu())
+            self.kdes.append(kde)
+    
+    # TODO the shapes of the returned samples and log_probs are wrong
+    def sample(self, n_samples):
+        samples = []
+        for kde in self.kdes:
+            samples.append(kde.resample(n_samples))
+        return torch.tensor(np.concatenate(samples, axis=0).T, dtype=torch.float32, device=self.device)
+    
+    def log_prob(self, x):
+        log_probs = []
+        for i, kde in enumerate(self.kdes):
+            log_probs.append(kde.logpdf(x[:,i].data.cpu()))
+        return torch.tensor(np.concatenate(log_probs, axis=0).T, dtype=torch.float32, device=self.device)
+
+class Histogram():
+    """
+    Wrapper around torch.distributions.Categorical to make it behave like scipy's rv_histogram
+    """
+    def __init__(self, X, bins):
+        self.device = X.device
+        # For each gene, compute the histogram, then create a discrete distribution
+        if type(bins) is list:
+            self.n_bins = len(bins)
+        else:
+            self.n_bins = bins
+        self.hist, bins = np.histogram(X.data.cpu(), bins=bins)
+        # Convert the bins to a tensor
+        self.bins = torch.tensor(bins, dtype=torch.float32, device=self.device)
+        self.dist = Categorical(torch.tensor(self.hist, dtype=torch.float32, device=self.device))
+
+    def sample(self, n_samples):
+        """
+        This should return real values, not indexes into the histogram
+        """
+        sample_idxs = self.dist.sample((n_samples,))
+        # Convert the indexes into real values
+        samples = self.bins[sample_idxs]
+        return samples
+    
+    def log_prob(self, x):
+        """
+        Return the log probability of the given data
+        """
+        # Convert the real values into indexes into the histogram
+        x_idxs = torch.bucketize(x, self.bins, out_int32=True)
+        x_idxs[x_idxs >= self.n_bins] = self.n_bins - 1
+        x_idxs[x_idxs < 0] = 0
+        # Compute the log probability of the indexes
+        return self.dist.log_prob(x_idxs)
+
+class IndependentHistogramNoise():
+    """
+    Simple noise distribution that assumes each gene is independent
+    """
+    def __init__(self, X, bins):
+        self.device = X.device
+        # For each gene, compute the histogram, then create a discrete distribution
+        self.dists = []
+        for i in range(X.shape[1]):
+            dist = Histogram(X[:,i], bins=bins)
+            self.dists.append(dist)
+
+    def sample(self, n_samples):
+        samples = torch.zeros((n_samples,len(self.dists)), device=self.device)
+        for i, dist in enumerate(self.dists):
+            sample = dist.sample(n_samples)
+            samples[:,i] = sample
+        return samples
+    
+    def log_prob(self, x):
+        log_probs = torch.zeros((len(x),1), device=self.device)
+        for i, dist in enumerate(self.dists):
+            log_probs += dist.log_prob(x[:,i]).unsqueeze(1)
+        return log_probs
+
+
+class PerturbationNoise():
+    """
+    Noise distribution that is a version of the current model with perturbed parameters
+    """
+    def __init__(self, model, X, ts, perturbation=0.1):
+        self.perturbation = perturbation
+        self.model = model
+        self.perturb_model = deepcopy(model)
+        self.ts = ts
+        self.X = X
+
+    def perturb_(self):
+        model_params = deepcopy(self.model.state_dict())
+        with torch.no_grad():
+            for param in model_params.values():
+                param += torch.randn_like(param)*self.perturbation
+        self.perturb_model.load_state_dict(model_params)
+
+    def sample(self, n_samples):
+        self.perturb_()
+        samples = self.perturb_model.simulate(self.X, self.ts)[len(self.ts)//2:].reshape((-1, self.X.shape[1]))
+        samples = samples[:n_samples,:]
+        samples = samples.to(self.model.device)
+        return samples.detach()
+    
+    def log_prob(self, x):
+        # Perturb the model parameters using dropout
+        self.perturb_()
+        log_prob = self.perturb_model.pxt.log_px(x, self.ts)
+        return log_prob.detach()
+    
+class NormalNoise():
+    def __init__(self, X):
+        cov = np.cov(X.data.cpu().numpy(), rowvar=False)
+        cov = torch.tensor(cov, device=X.device, dtype=torch.float32)
+        self.noise = torch.distributions.MultivariateNormal(
+            loc=X.mean(dim=0), 
+            covariance_matrix=cov)
+        
+    def sample(self, n_samples):
+        return self.noise.sample((n_samples,))
+
+    def log_prob(self, x):
+        return self.noise.log_prob(x).unsqueeze(1)
+
+class SelfNoise():
     """
     # TODO expand this description if this works well
     A noise distribution that is learned from the data
     """
-    def __init__(self, celldelta, ts):
+    def __init__(self, celldelta):
         super().__init__()
-        self.celldelta = celldelta
-        self.ts = ts
+        self.freeze(celldelta)
+
+    def freeze(self, celldelta):
+        """
+        Make a frozen copy of the cell delta model parameters
+        """
+        ux = celldelta.ux.model
+        pxt = celldelta.pxt.model
+        self.celldelta = CellDelta(input_dim=ux.layers[0].in_features,
+                                   ux_hidden_dim=ux.layers[0].out_features,
+                                   ux_layers=len([l for l in ux.layers if isinstance(l, Linear)])-1,
+                                   ux_dropout=celldelta.ux.dropout.p,
+                                   pxt_hidden_dim=pxt.layers[0].out_features,
+                                   pxt_layers=len([l for l in pxt.layers if isinstance(l, Linear)])-1,
+                                   pxt_dropout=celldelta.pxt.dropout.p,
+                                   device=celldelta.device)
+        celldelta_params = celldelta.state_dict().copy()
+        # Remove the copied parameters from the computation graph
+        for k in celldelta_params.keys():
+            celldelta_params[k] = celldelta_params[k].detach()
+
+        self.celldelta.load_state_dict(celldelta_params)
+        self.celldelta.eval()
     
     def generate(self, x0, ts):
         """
@@ -201,20 +425,20 @@ class SelfNoise(torch.nn.Module):
         """
         # Simulate steps in the ODE using the learned drift term
         # The take all the samples and flatten them into a single dimension
-        self.xts = self.celldelta.simulate(x0, ts).reshape((-1, x0.shape[1]))
+        self.xts = self.celldelta.simulate(x0, ts)[len(ts)//2:].reshape((-1, x0.shape[1])).detach()
 
     def sample(self, n_samples):
         """
         Sample from the learned noise distribution
         """
-        rand_idxs = torch.randperm(len(self.xts))[:n_samples[0]]
-        return self.xts[rand_idxs,:].detach().to(self.celldelta.device)
+        rand_idxs = torch.randperm(len(self.xts))[:n_samples]
+        return self.xts[rand_idxs,:].to(self.celldelta.device)
     
-    def log_prob(self, x):
+    def log_prob(self, x, ts):
         """
         Compute the log probability of the given data under the learned noise distribution
         """
-        return self.celldelta.pxt.log_px(x, ts=self.ts).squeeze(1)
+        return self.celldelta.pxt.log_px(x, ts=ts).squeeze(1)
 
 class CellDelta(nn.Module):
     """
@@ -237,14 +461,15 @@ class CellDelta(nn.Module):
             pxt_hidden_dim (int): The number of hidden units in each layer for the PXT model.
             pxt_layers (int): The number of layers in the PXT model.
             pxt_dropout (float): The dropout probability for the PXT model.
+            loss_type (str, optional): The type of loss to use for training. Defaults to 'nce'. Must be one of ('nce', 'ence', 'self').
             device (torch.device): The device to use for the model.
 
         Returns:
             None
         """
         super().__init__()
-        if loss_type not in ('nce', 'ence'):
-            raise ValueError('loss_type must be one of ("nce", "ence")')
+        if loss_type not in ('nce', 'ence', 'self'):
+            raise ValueError('loss_type must be one of ("nce", "ence", "self")')
         self.loss_type = loss_type
         self.normalize_gradient = normalize_gradient
         self.ux = Ux(input_dim, ux_hidden_dim, ux_layers, ux_dropout).to(device)
@@ -252,6 +477,23 @@ class CellDelta(nn.Module):
         self.device = device
         # Add the component models (ux, pxt, nce) to a module list
         self.models = torch.nn.ModuleDict({'ux':self.ux, 'pxt':self.pxt})
+
+    def self_loss(self, x, ts, p_eps, mcmc_step_size, mcmc_steps=10):
+        log_eps = torch.ones_like(x)*np.log(p_eps)
+
+        y = self.pxt.sample(x, n_steps=mcmc_steps, step_size=mcmc_step_size, eps=p_eps) # y ~ q(y|x)
+        
+        logp_x = self.pxt.log_px(x, ts) # logp(x)
+        logp_y = self.pxt.log_px(y, ts) # logp(y)
+
+        log2 = np.log(2)
+        lx = logp_x - torch.logaddexp(log2 + logp_x, log_eps)  # logp(x)/(log(2p(x)) + ε)
+        ly = logp_x - torch.logaddexp(log2 + logp_y, log_eps)  # logp(y)/(log(2p(y)) + ε)
+        leps = log_eps - torch.logaddexp(log2 + logp_y, log_eps)  # log(ε)/(log(2p(y)) + ε)
+
+        loss = lx.mean() + ly.mean() + leps.mean()
+
+        return -loss, 0
     
     def nce_loss(self, x, noise, ts):
         """
@@ -265,12 +507,12 @@ class CellDelta(nn.Module):
             torch.tensor: The NCE loss value.
             torch.tensor: The sample vs noise classification accuracy.
         """
-        y = noise.sample((x.shape[0],))
+        y = noise.sample(x.shape[0])
 
         logp_x = self.pxt.log_px(x, ts)  # logp(x)
-        logq_x = noise.log_prob(x).unsqueeze(1)  # logq(x)
+        logq_x = noise.log_prob(x) # logq(x)
         logp_y = self.pxt.log_px(y, ts)  # logp(y)
-        logq_y = noise.log_prob(y).unsqueeze(1)  # logq(y)
+        logq_y = noise.log_prob(y) # logq(y)
 
         value_x = logp_x - torch.logsumexp(torch.cat([logp_x, logq_x], dim=1), dim=1, keepdim=True)  # logp(x)/(logp(x) + logq(x))
         value_y = logq_y - torch.logsumexp(torch.cat([logp_y, logq_y], dim=1), dim=1, keepdim=True)  # logq(y)/(logp(y) + logq(y))
@@ -299,7 +541,7 @@ class CellDelta(nn.Module):
             torch.tensor: The eNCE loss value.
             torch.tensor: The sample vs noise classification accuracy.
         """
-        y = noise.sample((x.shape[0],))
+        y = noise.sample(x.shape[0])
 
         logp_x = self.pxt.log_px(x, ts)  # logp(x)
         logq_x = noise.log_prob(x).unsqueeze(1)  # logq(x)
@@ -359,7 +601,20 @@ class CellDelta(nn.Module):
         l_fp = ((dq_dt + dx)**2).mean()*alpha_fp
         return l_fp
 
-    def optimize(self, X, X0, ts, noise, restart=True, pxt_lr=5e-4, ux_lr=1e-3, alpha_fp=1, n_epochs=100, n_samples=1000, ratio_clip=(-10,10), verbose=False):
+    def consistency_loss(self, x, ts):
+        """
+        Enforce that the p(x,t_i) ~= p(x,t_0) for all t_i in ts
+        """
+        l_consistency = 0
+        zero = torch.zeros(1, requires_grad=True).to(self.device)
+        sum_log_pxt = self.pxt.log_pxt(x, ts).sum(dim=1)
+        sum_log_px0 = self.pxt.log_pxt(x, zero).sum(dim=1)
+        l_consistency += ((sum_log_pxt - sum_log_px0)**2).mean()
+        return l_consistency  
+
+    def optimize(self, X, X0, ts, px_noise, p0_noise, restart=True, 
+                 pxt_lr=5e-4, ux_lr=1e-3, alpha_fp=1, 
+                 n_epochs=100, n_samples=1000, ratio_clip=(-10,10), verbose=False):
         """
         Optimize the cell delta model parameters using the provided training data.
 
@@ -367,7 +622,8 @@ class CellDelta(nn.Module):
             X (torch.tensor): The input training data of shape (n_cells, n_genes).
             X0 (torch.tensor): The initial state of the cells of shape (n_cells, n_genes).
             ts (torch.tensor): The time points at which to evaluate the model of shape (n_timesteps,).
-            noise (torch.distributions): The noise distribution to use for the NCE loss.
+            px_noise (torch.distributions): The noise distribution to use for the NCE loss for the overall distribution.
+            p0_noise (torch.distributions): The noise distribution to use for the NCE loss for the initial conditions.
             restart (bool, optional): Whether to restart the optimization from scratch or continue from the current state. Defaults to True.
             pxt_lr (float, optional): The learning rate for the PXT model. Defaults to 5e-4.
             ux_lr (float, optional): The learning rate for the UX model. Defaults to 1e-3.
@@ -383,6 +639,8 @@ class CellDelta(nn.Module):
             nce_loss = self.nce_loss
         if self.loss_type == 'ence':
             nce_loss = self.ence_loss
+        if self.loss_type == 'self':
+            nce_loss = self.self_loss
 
         self.pxt_optimizer = torch.optim.Adam(self.pxt.parameters(), lr=pxt_lr)
         self.ux_optimizer = torch.optim.Adam(self.ux.parameters(), lr=ux_lr)
@@ -412,27 +670,29 @@ class CellDelta(nn.Module):
             x.requires_grad=True
             x0 = X0
 
-            # Generate a set of samples from the noise distribution
-            # TODO only generate every N epochs?
-            # noise.generate(x0, ts)
-
             self.pxt_optimizer.zero_grad()
             self.ux_optimizer.zero_grad()
 
             # Calculate the Noise-Constrastive Loss of the distribution
             # of p(x,t) marginalized over t: p(x) = \int p(x,t) dt
-            l_nce_px, acc_px = nce_loss(x, noise, ts=ts)
+            l_nce_px, acc_px = nce_loss(x, px_noise, ts=ts)
             l_nce_px.backward()
             
             # Calculate the Noise-Constrastive Loss of the initial distribution
-            l_nce_p0, acc_p0 = nce_loss(x0, noise, ts=zero)
+            l_nce_p0, acc_p0 = nce_loss(x0, p0_noise, ts=zero)
             l_nce_p0.backward()
 
+            # Calculate the consistency loss
+            l_consistency = self.consistency_loss(x, ts)
+            l_consistency.backward()
+
+            # Calculate the Fokker-Planck loss
             l_fp = self.fokker_planck_loss(x, ts, alpha_fp)
             l_fp.backward()
 
             # Take a gradient step
             # Normalize the pxt gradients:
+            # TODO is this the right normalization?
             if self.normalize_gradient:
                 for p in pxt.parameters():
                     p.grad /= torch.linalg.vector_norm(p.grad) + 1e-8
@@ -447,7 +707,7 @@ class CellDelta(nn.Module):
             if verbose:
                 print(f'{epoch} l_nce_px={float(l_nce_px):.5f}, acc_px={float(acc_px):.5f}, '
                     f'l_nce_p0={float(l_nce_p0):.5f}, acc_p0={float(acc_p0):.5f},'
-                    f'l_fp={float(l_fp):.5f}')
+                    f'l_fp={float(l_fp):.5f} l_consistency={float(l_consistency):.5f}')
                 
         return {'l_nce_px': l_nce_pxs, 'l_nce_p0': l_nce_p0s, 'l_fp': l_fps}
     
