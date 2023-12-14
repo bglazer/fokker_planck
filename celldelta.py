@@ -187,229 +187,6 @@ class Pxt(torch.nn.Module):
         samples = samples[torch.randperm(len(samples))[:len(x0)]] 
         return samples
 
-class KDENoise():
-    """
-    Noise distribution with a kernel density estimator
-    """
-    def __init__(self, X, bandwidth=None, chunk_size=None):
-        self.bandwidth = bandwidth
-        # self.kde = GaussianKDE(X, bw=.1, chunk_size=chunk_size)
-        self.kde = gaussian_kde(X.T.data.cpu(), bw_method=bandwidth)
-        self.device = X.device
-
-    def sample(self, n_samples):
-        return torch.tensor(self.kde.resample(n_samples).T, dtype=torch.float32, device=self.device)
-        # return self.kde.sample(n_samples)
-
-    def log_prob(self, x):
-        return torch.tensor(self.kde.logpdf(x.T.data.cpu()), dtype=torch.float32, device=self.device)
-        # return self.kde.log_prob(x)
-
-class CopulaNoise():
-    """
-    Noise distribution from a Gaussian Copula
-    """
-    def __init__(self, X):
-        self.copula = GaussianMultivariate()
-        self.copula.fit(X=X.data.cpu().numpy())
-        self.device = X.device
-
-    def sample(self, n_samples):
-        return torch.tensor(self.copula.sample(n_samples).to_numpy(), dtype=torch.float32, device=self.device)
-
-    # def sample(self, n_samples):
-    #     rand_idxs = torch.randperm(len(self.sample))[:n_samples]
-    #     return self.sample[rand_idxs,:].to(self.device)
-
-    def log_prob(self, x):
-        return torch.tensor(self.copula.log_probability_density(x.data.cpu()), dtype=torch.float32, device=self.device)
-    
-class IndependentKDENoise():
-    """
-    Simple noise distribution that assumes each gene is independent
-    """
-    def __init__(self, X):
-        self.X = X
-        self.device = X.device
-        # For each gene, compute a Gaussian KDE
-        self.kdes = []
-        for i in range(X.shape[1]):
-            kde = gaussian_kde(X[:,i].data.cpu())
-            self.kdes.append(kde)
-    
-    # TODO the shapes of the returned samples and log_probs are wrong
-    def sample(self, n_samples):
-        samples = []
-        for kde in self.kdes:
-            samples.append(kde.resample(n_samples))
-        return torch.tensor(np.concatenate(samples, axis=0).T, dtype=torch.float32, device=self.device)
-    
-    def log_prob(self, x):
-        log_probs = []
-        for i, kde in enumerate(self.kdes):
-            log_probs.append(kde.logpdf(x[:,i].data.cpu()))
-        return torch.tensor(np.concatenate(log_probs, axis=0).T, dtype=torch.float32, device=self.device)
-
-class Histogram():
-    """
-    Wrapper around torch.distributions.Categorical to make it behave like scipy's rv_histogram
-    """
-    def __init__(self, X, bins):
-        self.device = X.device
-        # For each gene, compute the histogram, then create a discrete distribution
-        if type(bins) is list:
-            self.n_bins = len(bins)
-        else:
-            self.n_bins = bins
-        self.hist, bins = np.histogram(X.data.cpu(), bins=bins)
-        # Convert the bins to a tensor
-        self.bins = torch.tensor(bins, dtype=torch.float32, device=self.device)
-        self.dist = Categorical(torch.tensor(self.hist, dtype=torch.float32, device=self.device))
-
-    def sample(self, n_samples):
-        """
-        This should return real values, not indexes into the histogram
-        """
-        sample_idxs = self.dist.sample((n_samples,))
-        # Convert the indexes into real values
-        samples = self.bins[sample_idxs]
-        return samples
-    
-    def log_prob(self, x):
-        """
-        Return the log probability of the given data
-        """
-        # Convert the real values into indexes into the histogram
-        x_idxs = torch.bucketize(x, self.bins, out_int32=True)
-        x_idxs[x_idxs >= self.n_bins] = self.n_bins - 1
-        x_idxs[x_idxs < 0] = 0
-        # Compute the log probability of the indexes
-        return self.dist.log_prob(x_idxs)
-
-class IndependentHistogramNoise():
-    """
-    Simple noise distribution that assumes each gene is independent
-    """
-    def __init__(self, X, bins):
-        self.device = X.device
-        # For each gene, compute the histogram, then create a discrete distribution
-        self.dists = []
-        for i in range(X.shape[1]):
-            dist = Histogram(X[:,i], bins=bins)
-            self.dists.append(dist)
-
-    def sample(self, n_samples):
-        samples = torch.zeros((n_samples,len(self.dists)), device=self.device)
-        for i, dist in enumerate(self.dists):
-            sample = dist.sample(n_samples)
-            samples[:,i] = sample
-        return samples
-    
-    def log_prob(self, x):
-        log_probs = torch.zeros((len(x),1), device=self.device)
-        for i, dist in enumerate(self.dists):
-            log_probs += dist.log_prob(x[:,i]).unsqueeze(1)
-        return log_probs
-
-
-class PerturbationNoise():
-    """
-    Noise distribution that is a version of the current model with perturbed parameters
-    """
-    def __init__(self, model, X, ts, perturbation=0.1):
-        self.perturbation = perturbation
-        self.model = model
-        self.perturb_model = deepcopy(model)
-        self.ts = ts
-        self.X = X
-
-    def perturb_(self):
-        model_params = deepcopy(self.model.state_dict())
-        with torch.no_grad():
-            for param in model_params.values():
-                param += torch.randn_like(param)*self.perturbation
-        self.perturb_model.load_state_dict(model_params)
-
-    def sample(self, n_samples):
-        self.perturb_()
-        samples = self.perturb_model.simulate(self.X, self.ts)[len(self.ts)//2:].reshape((-1, self.X.shape[1]))
-        samples = samples[:n_samples,:]
-        samples = samples.to(self.model.device)
-        return samples.detach()
-    
-    def log_prob(self, x):
-        # Perturb the model parameters using dropout
-        self.perturb_()
-        log_prob = self.perturb_model.pxt.log_px(x, self.ts)
-        return log_prob.detach()
-    
-class NormalNoise():
-    def __init__(self, X):
-        cov = np.cov(X.data.cpu().numpy(), rowvar=False)
-        cov = torch.tensor(cov, device=X.device, dtype=torch.float32)
-        self.noise = torch.distributions.MultivariateNormal(
-            loc=X.mean(dim=0), 
-            covariance_matrix=cov)
-        
-    def sample(self, n_samples):
-        return self.noise.sample((n_samples,))
-
-    def log_prob(self, x):
-        return self.noise.log_prob(x).unsqueeze(1)
-
-class SelfNoise():
-    """
-    # TODO expand this description if this works well
-    A noise distribution that is learned from the data
-    """
-    def __init__(self, celldelta):
-        super().__init__()
-        self.freeze(celldelta)
-
-    def freeze(self, celldelta):
-        """
-        Make a frozen copy of the cell delta model parameters
-        """
-        ux = celldelta.ux.model
-        pxt = celldelta.pxt.model
-        self.celldelta = CellDelta(input_dim=ux.layers[0].in_features,
-                                   ux_hidden_dim=ux.layers[0].out_features,
-                                   ux_layers=len([l for l in ux.layers if isinstance(l, Linear)])-1,
-                                   pxt_hidden_dim=pxt.layers[0].out_features,
-                                   pxt_layers=len([l for l in pxt.layers if isinstance(l, Linear)])-1,
-                                   device=celldelta.device)
-        celldelta_params = celldelta.state_dict().copy()
-        # Remove the copied parameters from the computation graph
-        for k in celldelta_params.keys():
-            celldelta_params[k] = celldelta_params[k].detach()
-
-        self.celldelta.load_state_dict(celldelta_params)
-        self.celldelta.eval()
-    
-    def generate(self, x0, ts):
-        """
-        Generate a set of samples from the noise distribution, by simulating
-        the Fokker-Planck equation with the learned drift term u(x)
-
-        Sets the SelfNoise.xts attribute to the generated samples
-        """
-        # Simulate steps in the ODE using the learned drift term
-        # The take all the samples and flatten them into a single dimension
-        self.xts = self.celldelta.simulate(x0, ts)[len(ts)//2:].reshape((-1, x0.shape[1])).detach()
-
-    def sample(self, n_samples):
-        """
-        Sample from the learned noise distribution
-        """
-        rand_idxs = torch.randperm(len(self.xts))[:n_samples]
-        return self.xts[rand_idxs,:].to(self.celldelta.device)
-    
-    def log_prob(self, x, ts):
-        """
-        Compute the log probability of the given data under the learned noise distribution
-        """
-        return self.celldelta.pxt.log_px(x, ts=ts).squeeze(1)
-
 class CellDelta(nn.Module):
     """
     CellDelta is a learned model of cell differentiation in single-cell RNA-seq single timepoint data.
@@ -563,10 +340,10 @@ class CellDelta(nn.Module):
 
             # Calculate the Noise-Constrastive Loss of the distribution
             # of p(x,t) marginalized over t: p(x) = \int p(x,t) dt
-            # l_nce_px, acc_px = nce_loss(x, px_noise, ts=ts)
-            # l_nce_px.backward()
-            l_nce_px = zero
-            acc_px = zero
+            l_nce_px, acc_px = nce_loss(x, px_noise, ts=ts)
+            l_nce_px.backward()
+            # l_nce_px = zero
+            # acc_px = zero
             
             # Calculate the Noise-Constrastive Loss of the initial distribution
             l_nce_p0, acc_p0 = nce_loss(x0, p0_noise, ts=zero)
@@ -597,7 +374,7 @@ class CellDelta(nn.Module):
                 
         return {'l_nce_px': l_nce_pxs, 'l_nce_p0': l_nce_p0s, 'l_fp': l_fps}
     
-    def simulate(self, X0, tsim, zero_boundary=True):
+    def simulate(self, X0, tsim, ux_alpha=1, zero_boundary=True):
         # Simulate the stochastic differential equation using the Euler-Maruyama method
         # with the learned drift term u(x)
         x = X0.clone().detach()
@@ -608,7 +385,7 @@ class CellDelta(nn.Module):
 
         for i in range(len(tsim)):
             # Compute the drift term
-            u = self.ux(x)
+            u = self.ux(x)*ux_alpha
             # Compute the diffusion term
             # Generate a set of random numbers
             dW = torch.randn_like(x) * torch.sqrt(ht)
