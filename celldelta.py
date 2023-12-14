@@ -130,7 +130,7 @@ class Pxt(torch.nn.Module):
         """
         Marginalize out the t dimension to get log(p(x))
         """
-        return torch.logsumexp(self.log_pxt(x, ts), dim=0) - torch.log(torch.tensor(ts.shape[0], device=x.device, dtype=torch.float32))
+        return torch.logsumexp(self.log_pxt(x, ts), dim=0) - torch.log(torch.tensor(len(ts), device=x.device, dtype=torch.float32))
     
     def dx_dt(self, x, ts):
         """
@@ -209,9 +209,9 @@ class CellDelta(nn.Module):
         q(x,t) = log p(x,t)
         d/dt q(x,t) = \sum_{i=1}^{N} -[u(x)*dq(x,t)/dx_i + du(x)/dx]
 
-        u (torch.Tensor): The tensor representing the potential energy.
-        dq_dx (torch.Tensor): The tensor representing the derivative of the log probability with respect to x.
-        du_dx (torch.Tensor): The tensor representing the derivative of the potential energy with respect to x.
+        u(x): The drift function
+        dq_dx: The derivative of the log probability with respect to x.
+        du_dx: The derivative of the drift term with respect to x.
         
         Args:
             x (torch.Tensor): The input data of shape (n_cells, n_genes).
@@ -220,30 +220,40 @@ class CellDelta(nn.Module):
         Returns:
             torch.Tensor: The tensor representing loss enforcing constraint to the Fokker-Planck term.
         """
-
+        xts = self.pxt.xts(x, ts)
+        px_ux = (self.pxt.model(xts) * self.ux(xts[:,:,:-1]))
+        px_ux_dx = torch.autograd.grad(outputs=px_ux,
+                                       inputs=xts, 
+                                       grad_outputs=torch.ones_like(px_ux),
+                                       create_graph=True,
+                                       retain_graph=True)[0]
+        
         # Calculate the derivative of the log probability with respect to x and t
         # dq_dt = Left hand side of the Fokker-Planck equation: d/dt q(x,t)
         dq_dx, dq_dt = self.pxt.dx_dt(x, ts)
-        du_dx = self.ux.dx(x)
-        ux = self.ux(x)
+        # du_dx = self.ux.dx(x)
+        # ux = self.ux(x)
         # Right hand side of the Fokker-Planck equation: \sum_{i=1}^{N} -[u(x)*dq(x,t)/dx_i + du(x)/dx]
-        dxi = ux*dq_dx + du_dx
+        # dxi = ux*dq_dx + du_dx
         # Sum over the samples
-        dx = dxi.sum(dim=2, keepdim=True)
+        # dx = dxi.sum(dim=2, keepdim=True)
+
+        # The :-1 term is to get the gradient with respect to all the x's, 
+        # the last term (-1) is the gradient with respect to t
+        dx = px_ux_dx[:,:,:-1].sum(dim=2, keepdim=True)
             
         # Enforce that dq_dt = -dx, i.e. that both sides of the fokker planck equation are equal
-        l_fp = ((dq_dt + dx)**2).mean()
+        l_fp = ((dq_dt - dx)**2).mean()
         return l_fp
 
     def consistency_loss(self, x, ts):
         """
         Enforce that the p(x,t_i) ~= p(x,t_0) for all t_i in ts
         """
-        l_consistency = 0
         zero = torch.zeros(1, requires_grad=True).to(self.device)
-        sum_log_pxt = self.pxt.log_pxt(x, ts).sum(dim=1)
-        sum_log_px0 = self.pxt.log_pxt(x, zero).sum(dim=1)
-        l_consistency += ((sum_log_pxt - sum_log_px0)**2).mean()
+        mean_log_pxt = self.pxt.log_pxt(x, ts).mean(dim=1)
+        mean_log_px0 = self.pxt.log_pxt(x, zero).mean(dim=1)
+        l_consistency = ((mean_log_pxt - mean_log_px0)**2).mean()
         return l_consistency  
     
     def px_loss(self, x, ts, mcmc_step_size, mcmc_steps=1):
@@ -259,6 +269,29 @@ class CellDelta(nn.Module):
         loss = lx.mean() + ly.mean() + leps.mean()
 
         return -loss
+
+    def nce_loss(self, x, ts, noise):
+        #  Generate samples from noise
+        n_samples = x.shape[0]
+        y = noise.sample((n_samples,))
+
+        logp_x = self.pxt.log_px(x, ts)  # logp(x)
+        logq_x = self.noise.log_prob(x).unsqueeze(1)  # logq(x)
+        logp_y = self.pxt.log_px(y, ts)  # logp(y)
+        logq_y = self.noise.log_prob(y).unsqueeze(1)  # logq(y)
+
+        value_x = logp_x - torch.logaddexp(logp_x, logq_x)  # logp(x)/(logp(x) + logq(x))
+        value_y = logq_y - torch.logaddexp(logp_y, logq_y)  # logq(y)/(logp(y) + logq(y))
+
+        v = value_x.mean() + value_y.mean()
+
+        # Classification of noise vs target
+        r_x = torch.sigmoid(logp_x - logq_x)
+        r_y = torch.sigmoid(logq_y - logp_y)
+
+        acc = ((r_x > 1/2).sum() + (r_y > 1/2).sum()).item() / (len(x) + len(y))
+
+        return -v, acc
     
     def optimize(self, X, X0, ts,
                  pxt_lr=5e-4, ux_lr=1e-3, 
@@ -282,12 +315,11 @@ class CellDelta(nn.Module):
         Returns:
             dict: A dictionary containing the loss values for each epoch.
         """
-
         self.pxt_optimizer = torch.optim.Adam(self.pxt.parameters(), lr=pxt_lr)
         self.ux_optimizer = torch.optim.Adam(self.ux.parameters(), lr=ux_lr)
 
         # Convenience variable for the time t=0
-        zero = torch.zeros(1, requires_grad=True).to(self.device)
+        zero = torch.zeros(1).to(self.device)
         
         l_self_pxs = np.zeros(n_epochs)
         l_self_p0s = np.zeros(n_epochs)
@@ -305,45 +337,53 @@ class CellDelta(nn.Module):
             self.pxt_optimizer.zero_grad()
             self.ux_optimizer.zero_grad()
 
-            # Calculate the Noise-Constrastive Loss of the distribution
+            # Calculate the Self Supervised Loss of the distribution
             # of p(x,t) marginalized over t: p(x) = \int p(x,t) dt
-            l_self_px = self.px_loss(x, ts=ts, 
-                                     mcmc_step_size=mcmc_step_size, 
-                                     mcmc_steps=mcmc_steps)
-            l_self_px.backward()
-            # l_self_px = zero
-            
-            # Calculate the Noise-Constrastive Loss of the initial distribution
-            l_self_p0 = self.px_loss(x0, ts=zero, 
-                                     mcmc_step_size=mcmc_step_size, 
-                                     mcmc_steps=mcmc_steps)
-            l_self_p0.backward()
+            # l_px = self.px_loss(x, ts=ts, 
+            #                          mcmc_step_size=mcmc_step_size, 
+            #                          mcmc_steps=mcmc_steps)
+            # l_px.backward()
+            # l_px = zero
 
-            # Calculate the consistency loss
-            # l_consistency = self.consistency_loss(x, ts)
-            # l_consistency.backward()
-            l_consistency = zero
+            # Calculate the NCE loss of the distribution
+            # of p(x,t) marginalized over t: p(x) = \int p(x,t) dt
+            # l_pxts, acc = self.nce_loss(x, ts=ts, noise=self.noise)
+            # l_pxts.backward()
+            l_pxts = zero
+            acc =0
+                        
+            # Calculate the Self Supervised Loss of the initial distribution
+            # l_px0 = self.px_loss(x0, ts=zero, 
+            #                          mcmc_step_size=mcmc_step_size, 
+            #                          mcmc_steps=mcmc_steps)
+            l_px0, acc0 = self.nce_loss(x0, ts=zero, noise=self.noise0)
+            l_px0.backward()
 
             # Calculate the Fokker-Planck loss
             # l_fp = self.fokker_planck_loss(x, ts)
             # l_fp.backward()
             l_fp = zero
 
+            # l_consistency = self.consistency_loss(x, ts)
+            # l_consistency.backward()
+            l_consistency = zero
+
             self.pxt_optimizer.step()
             self.ux_optimizer.step()
 
             # Record the losses
-            l_self_pxs[epoch] = float(l_self_px.mean())
-            l_self_p0s[epoch] = float(l_self_p0.mean())
+            l_self_pxs[epoch] = float(l_pxts.mean())
+            l_self_p0s[epoch] = float(l_px0.mean())
             l_fps[epoch] = float(l_fp.mean())
             
             if verbose:
-                print(f'{epoch} l_self_px={float(l_self_px):.5f}, l_self_p0={float(l_self_p0):.5f}, '
-                      f'l_fp={float(l_fp):.5f} l_consistency={float(l_consistency):.5f}')
+                print(f'{epoch} l_self_px={float(l_pxts):.5f}, l_self_p0={float(l_px0):.5f}, '
+                      f'l_fp={float(l_fp):.5f} l_consistency={float(l_consistency):.5f}, '
+                      f'acc={acc:.5f}, acc0={acc0:.5f}')
                 
         return {'l_self_px': l_self_pxs, 'l_self_p0': l_self_p0s, 'l_fp': l_fps}
     
-    def simulate(self, X0, tsim, zero_boundary=True):
+    def simulate(self, X0, tsim, zero_boundary=True, ux_alpha=1.):
         # Simulate the stochastic differential equation using the Euler-Maruyama method
         # with the learned drift term u(x)
         x = X0.clone().detach()
@@ -354,7 +394,7 @@ class CellDelta(nn.Module):
 
         for i in range(len(tsim)):
             # Compute the drift term
-            u = self.ux(x)
+            u = self.ux(x)*ux_alpha
             # Compute the diffusion term
             # Generate a set of random numbers
             dW = torch.randn_like(x) * torch.sqrt(ht)
