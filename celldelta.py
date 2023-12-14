@@ -251,14 +251,19 @@ class CellDelta(nn.Module):
         acc = ((r_x > 1/2).sum() + (r_y > 1/2).sum()).cpu().numpy() / (len(x) + len(y))
         
         return -v, acc
-    
-    def fokker_planck_loss(self, x, ts, alpha_fp):
+
+    def fokker_planck_loss(self, x, ts):
         """
         This is the calculation of the term that ensures the derivatives match the log scale Fokker-Planck equation
         q(x,t) = log p(x,t)
         d/dt q(x,t) = \sum_{i=1}^{N} -[u(x)*dq(x,t)/dx_i + du(x)/dx]
 
+        u(x): The drift function
+        dq_dx: The derivative of the log probability with respect to x.
+        du_dx: The derivative of the drift term with respect to x.
         Args:
+            x (torch.Tensor): The input data of shape (n_cells, n_genes).
+            ts (torch.Tensor): The time points at which to evaluate the model of shape (n_timesteps,).
             u (torch.Tensor): The tensor representing the potential energy.
             dq_dx (torch.Tensor): The tensor representing the derivative of the log probability with respect to x.
             du_dx (torch.Tensor): The tensor representing the derivative of the potential energy with respect to x.
@@ -266,31 +271,35 @@ class CellDelta(nn.Module):
         Returns:
             torch.Tensor: The tensor representing loss enforcing constraint to the Fokker-Planck term.
         """
-
+        x.requires_grad = True
+        ts.requires_grad = True
+        xts = self.pxt.xts(x, ts)
+        px_ux = (self.pxt.model(xts) * self.ux(xts[:,:,:-1]))
+        px_ux_dx = torch.autograd.grad(outputs=px_ux,
+                                       inputs=xts, 
+                                       grad_outputs=torch.ones_like(px_ux),
+                                       create_graph=True,
+                                       retain_graph=True)[0]
+        
         # Calculate the derivative of the log probability with respect to x and t
         # dq_dt = Left hand side of the Fokker-Planck equation: d/dt q(x,t)
         dq_dx, dq_dt = self.pxt.dx_dt(x, ts)
-        du_dx = self.ux.dx(x)
-        ux = self.ux(x)
-        # Right hand side of the Fokker-Planck equation: \sum_{i=1}^{N} -[u(x)*dq(x,t)/dx_i + du(x)/dx]
-        dxi = ux*dq_dx + du_dx
-        # Sum over the samples
-        dx = dxi.sum(dim=2, keepdim=True)
+        dx = px_ux_dx[:,:,:-1].sum(dim=2, keepdim=True)
             
         # Enforce that dq_dt = -dx, i.e. that both sides of the fokker planck equation are equal
-        l_fp = ((dq_dt + dx)**2).mean()*alpha_fp
+        l_fp = ((dq_dt + dx)**2).mean()
         return l_fp
+
 
     def consistency_loss(self, x, ts):
         """
         Enforce that the p(x,t_i) ~= p(x,t_0) for all t_i in ts
         """
-        l_consistency = 0
-        zero = torch.zeros(1, requires_grad=True).to(self.device)
-        sum_log_pxt = self.pxt.log_pxt(x, ts).sum(dim=1)
-        sum_log_px0 = self.pxt.log_pxt(x, zero).sum(dim=1)
-        l_consistency += ((sum_log_pxt - sum_log_px0)**2).mean()
-        return l_consistency  
+        zero = torch.zeros(1).to(self.device)
+        sum_log_pxt = self.pxt.log_pxt(x, ts).mean(dim=1)
+        sum_log_px0 = self.pxt.log_pxt(x, zero).mean(dim=1).detach()
+        l_consistency = ((sum_log_pxt - sum_log_px0)**2).mean()
+        return l_consistency
 
     def optimize(self, X, X0, ts, px_noise, p0_noise,
                  pxt_lr=5e-4, ux_lr=1e-3,  
@@ -304,12 +313,10 @@ class CellDelta(nn.Module):
             ts (torch.tensor): The time points at which to evaluate the model of shape (n_timesteps,).
             px_noise (torch.distributions): The noise distribution to use for the NCE loss for the overall distribution.
             p0_noise (torch.distributions): The noise distribution to use for the NCE loss for the initial conditions.
-            restart (bool, optional): Whether to restart the optimization from scratch or continue from the current state. Defaults to True.
             pxt_lr (float, optional): The learning rate for the PXT model. Defaults to 5e-4.
             ux_lr (float, optional): The learning rate for the UX model. Defaults to 1e-3.
             n_epochs (int, optional): The number of epochs to train for. Defaults to 100.
             n_samples (int, optional): The number of data samples to use in training for each epoch. Defaults to 1000.
-            hx (float, optional): The step size for the numerical differentiation. Defaults to 1e-3.
             verbose (bool, optional): Whether to print the optimization progress. Defaults to False.
 
         Returns:
@@ -355,9 +362,9 @@ class CellDelta(nn.Module):
             l_consistency = zero
 
             # Calculate the Fokker-Planck loss
-            # l_fp = self.fokker_planck_loss(x, ts, alpha_fp)
-            # l_fp.backward()
-            l_fp = zero
+            l_fp = self.fokker_planck_loss(x, ts)
+            l_fp.backward()
+            # l_fp = zero
 
             self.pxt_optimizer.step()
             self.ux_optimizer.step()

@@ -26,9 +26,9 @@ adata = sc.read_h5ad(f'{genotype}_{dataset}.h5ad')
 nmp_cell_mask = adata.obs['cell_type'] == 'NMP'
 gene = 'POU5F1'
 X = adata[:, adata.var_names == gene].X.toarray()
-X = torch.tensor(X, device=device, dtype=torch.float32, requires_grad=True)
+X = torch.tensor(X, device=device, dtype=torch.float32)
 X0 = adata[nmp_cell_mask, adata.var_names == gene].X.toarray()
-X0 = torch.tensor(X0, device=device, dtype=torch.float32, requires_grad=True)
+X0 = torch.tensor(X0, device=device, dtype=torch.float32)
 
 #%%
 # Plot the two distributions
@@ -38,38 +38,52 @@ _=plt.hist(X.data.cpu().numpy(), bins=30, alpha=.3, label='X')
 plt.legend()
 
 #%%
-ts = torch.linspace(0, 1, 100, device=device, requires_grad=True)
-epochs = 500
+ts = torch.linspace(0, 1, 100, device=device)*100
+epochs = 1000
 n_samples = 1000
 hx = 1e-3
 ht = ts[1] - ts[0]
-zero = torch.zeros(1, requires_grad=True).to(device)
+zero = torch.zeros(1).to(device)
 
 #%%
 # Initialize the model
-ux_dropout = 0
-pxt_dropout = 0
-
 celldelta = CellDelta(input_dim=1, device=device,
                       ux_hidden_dim=64, ux_layers=2, 
                       pxt_hidden_dim=64, pxt_layers=2)
+mean = X.mean(dim=0)
+cov = np.cov(X.cpu().numpy().T)
+cov = cov + np.eye(1)*1e-3
+cov = torch.tensor(cov, dtype=torch.float32).to(device)
+noise = D.MultivariateNormal(mean, cov)
+mean0 = X0.mean(dim=0)
+cov0 = np.cov(X0.cpu().numpy().T)
+cov0 = cov0 + np.eye(1)*1e-3
+cov0 = torch.tensor(cov0, dtype=torch.float32).to(device)
+noise0 = D.MultivariateNormal(mean0, cov0)
 
 #%%
 # Train the model
+losses = celldelta.optimize(X0, X0, ts,
+                            pxt_lr=1e-3, ux_lr=1e-3, 
+                            n_epochs=epochs, n_samples=n_samples, 
+                            px_noise=noise0, p0_noise=noise0,
+                            verbose=True)
+
 losses = celldelta.optimize(X, X0, ts,
                             pxt_lr=1e-3, ux_lr=1e-3, 
-                            alpha_fp=1, n_epochs=epochs, n_samples=n_samples, 
+                            n_epochs=epochs, n_samples=n_samples, 
+                            px_noise=noise, p0_noise=noise0,
                             verbose=True)
 
 #%%
 l_fps = losses['l_fp']
-l_self_pxs = losses['l_self_px']
-l_self_p0s = losses['l_self_p0']
+l_pxs = losses['l_nce_px']
+l_p0s = losses['l_nce_p0']
 
 fig, axs = plt.subplots(3, 1, figsize=(10,10))
 axs[0].plot(l_fps[10:], label='l_fp')
-axs[1].plot(l_self_pxs[10:], label='l_self_pxs')
-axs[2].plot(l_self_p0s[10:], label='l_self_p0')
+axs[1].plot(l_pxs[10:], label='l_pxs')
+axs[2].plot(l_p0s[10:], label='l_p0')
 [axs[i].set_xlabel('Epoch') for i in range(len(axs))]
 [axs[i].set_ylabel('Loss') for i in range(len(axs))]
 [axs[i].legend() for i in range(len(axs))]
@@ -86,7 +100,7 @@ l = low-.25*(high-low)
 h = high+.25*(high-low)
 xs = torch.arange(0, h, .01, device=device)[:,None]
 
-pxts = torch.exp(celldelta.pxt(xs, ts)).squeeze().T.cpu().detach().numpy()
+pxts = np.exp(celldelta.pxt.log_pxt(xs, ts).squeeze().T.cpu().detach().numpy())
 uxs = celldelta.ux(xs).squeeze().cpu().detach().numpy()
 
 # TODO need to calculate the gradient of u(x) and p(x,t) wrt x
@@ -103,10 +117,11 @@ x_density, x_bins = np.histogram(X.detach().cpu().numpy(), bins=30, density=True
 w = x_bins[1] - x_bins[0]
 plt.bar(height=x_density, x=x_bins[:-1], width=w, alpha=.3, label='X')
 plt.hist(X0.detach().cpu().numpy(), bins=30, alpha=.3, label='X0', density=True, color='orange')
-for i in range(0, ts.shape[0], int(len(ts)/10)):
+# Get a list of timesteps to plot, with first and last timestep included
+for i in np.linspace(0, len(ts)-1, 10, dtype=int):
     t = ts[i]
     z = pxts[:,i].sum()
-    plt.plot(xs, pxts[:,i], c=viridis(float(t)))
+    plt.plot(xs, pxts[:,i], c=viridis(float(t/ts.max())), alpha=.5)
 plt.xlabel('x')
 plt.ylabel('p(x,t)')
 # Add a colorbar to show the timestep
@@ -135,7 +150,6 @@ plt.xlabel('timestep (t)')
 plt.xticks(ticks=np.linspace(0, sim_cum_pxt.shape[1], 10),
               labels=np.round(np.linspace(0, 1, 10), 2))
 plt.colorbar()
-
 
 #%%
 # This is the individual p(x,t) at each timestep t, going from t=0 (left) to t=1 (right)
@@ -168,7 +182,7 @@ x = X0.clone().detach()
 tsim = torch.linspace(0, 1, 100, device=device, requires_grad=False)
 zero_boundary = True
 
-xts = celldelta.simulate(x, tsim, zero_boundary=zero_boundary)
+xts = celldelta.simulate(x, tsim, zero_boundary=zero_boundary, ux_alpha=100)
 
 #%%
 # Plot the resulting probability densities at each timestep
