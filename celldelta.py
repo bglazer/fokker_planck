@@ -273,21 +273,37 @@ class CellDelta(nn.Module):
         """
         x.requires_grad = True
         ts.requires_grad = True
-        xts = self.pxt.xts(x, ts)
-        px_ux = (self.pxt.model(xts) * self.ux(xts[:,:,:-1]))
-        px_ux_dx = torch.autograd.grad(outputs=px_ux,
-                                       inputs=xts, 
-                                       grad_outputs=torch.ones_like(px_ux),
-                                       create_graph=True,
-                                       retain_graph=True)[0]
+        # Fokker-Planck equation:
+        # d/dt p(x,t) = \sum_{i=1]^{N} d/dx_i [u(x)*p(x,t)]
+        # Let q = logp(x,t), so that we can compute the derivative of the log probability
+        # d/dt q(x,t) = \sum_{i=1}^{N} -[u(x)*dq(x,t)/dx_i + du(x)/dx] 
+        ux = self.ux(x)
+        du_dx = torch.autograd.grad(outputs=ux,
+                                    inputs=x,
+                                    grad_outputs=torch.ones_like(self.ux(x)),
+                                    create_graph=True,
+                                    retain_graph=True)[0]
+        dq_dx, dq_dt = self.pxt.dx_dt(x, ts)
+
+        d_dx = (dq_dx * ux + du_dx).sum(dim=2, keepdim=True)
+        d_dt = dq_dt
+
+        # Enforce that dq_dt = -dx, i.e. that both sides of the fokker planck equation are equal
+        l_fp = ((d_dx + d_dt)**2).mean()
+        
+        
+        # px_ux = (self.pxt.model(xts) + self.ux(xts[:,:,:-1]))
+        # px_ux_dx = torch.autograd.grad(outputs=px_ux,
+        #                                inputs=xts, 
+        #                                grad_outputs=torch.ones_like(px_ux),
+        #                                create_graph=True,
+        #                                retain_graph=True)[0]
         
         # Calculate the derivative of the log probability with respect to x and t
         # dq_dt = Left hand side of the Fokker-Planck equation: d/dt q(x,t)
-        dq_dx, dq_dt = self.pxt.dx_dt(x, ts)
-        dx = px_ux_dx[:,:,:-1].sum(dim=2, keepdim=True)
+        # dx = px_ux_dx[:,:,:-1].sum(dim=2, keepdim=True)
             
-        # Enforce that dq_dt = -dx, i.e. that both sides of the fokker planck equation are equal
-        l_fp = ((dq_dt + dx)**2).mean()
+        # l_fp = ((dq_dt + dx)**2).mean()
         return l_fp
 
 
@@ -302,7 +318,7 @@ class CellDelta(nn.Module):
         return l_consistency
 
     def optimize(self, X, X0, ts, px_noise, p0_noise,
-                 pxt_lr=5e-4, ux_lr=1e-3,  
+                 pxt_lr=5e-4, ux_lr=1e-3, fokker_planck=True,  
                  n_epochs=100, n_samples=1000, verbose=False):
         """
         Optimize the cell delta model parameters using the provided training data.
@@ -362,9 +378,11 @@ class CellDelta(nn.Module):
             l_consistency = zero
 
             # Calculate the Fokker-Planck loss
-            l_fp = self.fokker_planck_loss(x, ts)
-            l_fp.backward()
-            # l_fp = zero
+            if fokker_planck:
+                l_fp = self.fokker_planck_loss(x, ts)
+                l_fp.backward()
+            else:
+                l_fp = zero
 
             self.pxt_optimizer.step()
             self.ux_optimizer.step()
@@ -381,25 +399,96 @@ class CellDelta(nn.Module):
                 
         return {'l_nce_px': l_nce_pxs, 'l_nce_p0': l_nce_p0s, 'l_fp': l_fps}
     
-    def simulate(self, X0, tsim, ux_alpha=1, zero_boundary=True):
-        # Simulate the stochastic differential equation using the Euler-Maruyama method
-        # with the learned drift term u(x)
+    def optimize_fokker_planck(self, X, ts, ux=True, px=True,
+                               pxt_lr=5e-4, ux_lr=1e-3,  
+                               n_epochs=100, n_samples=1000, verbose=False):
+        """
+        Optimize the Fokker-Planck component of the loss independently of the NCE component.
+        """
+        self.pxt_optimizer = torch.optim.Adam(self.pxt.parameters(), lr=pxt_lr)
+        self.ux_optimizer = torch.optim.Adam(self.ux.parameters(), lr=ux_lr)
+
+        l_fps = np.zeros(n_epochs)
+        
+        n_samples = min(n_samples, len(X))
+
+        for epoch in range(n_epochs):
+            # Sample from the data distribution
+            rand_idxs = torch.randperm(len(X))[:n_samples]
+            x = X[rand_idxs].clone().detach()
+
+            self.pxt_optimizer.zero_grad()
+            self.ux_optimizer.zero_grad()
+
+            
+            # Calculate the Fokker-Planck loss
+            l_fp = self.fokker_planck_loss(x, ts)
+            l_fp.backward()
+
+            if ux:
+                self.ux_optimizer.step()
+            if px:
+                self.pxt_optimizer.step()
+
+            # Record the losses
+            l_fps[epoch] = float(l_fp.mean())
+            
+            if verbose:
+                print(f'l_fp={float(l_fp):.5f}')
+                
+        return {'l_fp': l_fps}
+    
+    def optimize_initial_conditions(self, X0, ts, p0_noise, pxt_lr=1e-3,
+                                    n_epochs=100, verbose=False):
+        """
+        Optimize the initial conditions of the model.
+        """
+        nce_loss = self.nce_loss
+
+        self.pxt_optimizer = torch.optim.Adam(self.pxt.parameters(), lr=pxt_lr)
+
+        l_nce_p0s = np.zeros(n_epochs)
+        
+        for epoch in range(n_epochs):
+            ti = torch.randint(0, len(ts), (1,)).item()
+            t = ts[ti,None].detach()
+
+            self.pxt_optimizer.zero_grad()
+            
+            # Fit every time to the initial conditions
+            l_nce_p0, acc_p0 = nce_loss(X0, p0_noise, ts=t)
+            l_nce_p0.backward()
+
+            self.pxt_optimizer.step()
+
+            # Record the losses
+            l_nce_p0s[epoch] = float(l_nce_p0.mean())
+            
+            if verbose:
+                print(f'{epoch} l_nce_p0={float(l_nce_p0):.5f}, acc_p0={float(acc_p0):.5f}')
+                
+        return {'l_nce_p0': l_nce_p0s}
+                                    
+
+    def simulate(self, X0, tsim, ux_alpha=1, sigma=1, zero_boundary=True):
+        """
+        Simulate the stochastic differential equation using the Euler-Maruyama method
+        with the learned drift term u(x)
+        """
         x = X0.clone().detach()
-        tsim = torch.linspace(0, 1, 100, device=self.device, requires_grad=False)
         xts = torch.zeros((len(tsim), x.shape[0], x.shape[1]), device='cpu')
         ht = tsim[1] - tsim[0]
         zero_boundary = zero_boundary
-
+        sigma = torch.ones_like(x)*sigma
+        
         for i in range(len(tsim)):
             # Compute the drift term
             u = self.ux(x)*ux_alpha
             # Compute the diffusion term
             # Generate a set of random numbers
             dW = torch.randn_like(x) * torch.sqrt(ht)
-            sigma = torch.ones_like(x)
             # Compute the change in x
             dx = u * ht + sigma * dW
-            # print(f'{float(u.mean()):.5f}, {float(ht):.3f}, {float(dW.mean()): .5f}, {float(dx.mean()): .5f}')
             dx = dx.squeeze(0)
             # Update x
             x = x + dx

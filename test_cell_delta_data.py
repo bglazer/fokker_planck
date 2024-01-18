@@ -1,4 +1,4 @@
-#%%
+#%%`
 %load_ext autoreload
 %autoreload 2
 #%%
@@ -11,6 +11,7 @@ from celldelta import CellDelta
 from sklearn.decomposition import PCA
 import time
 import torch.distributions as D
+from umap import UMAP
 
 #%%
 device = 'cuda:1'
@@ -65,11 +66,14 @@ noise0 = D.MultivariateNormal(mean0, cov0)
 # Train the model
 # Get the start time
 start = time.time()
-losses = celldelta.optimize(X0, X0, ts, pxt_lr=1e-3, ux_lr=1e-3,
-                            n_epochs=500, n_samples=n_samples, 
-                            px_noise=noise0, p0_noise=noise0,
-                            verbose=True)
-
+losses = celldelta.optimize_initial_conditions(X0, ts, 
+                                               n_epochs=1500,
+                                               p0_noise=noise0,
+                                               verbose=True)
+end = time.time()
+print(f'Training took {end-start:.2f} seconds')
+#%%
+start = time.time()
 losses = celldelta.optimize(X, X0, ts, pxt_lr=1e-3, ux_lr=1e-3, 
                             n_epochs=500, n_samples=n_samples, 
                             px_noise=noise, p0_noise=noise0,
@@ -77,6 +81,12 @@ losses = celldelta.optimize(X, X0, ts, pxt_lr=1e-3, ux_lr=1e-3,
 # Get the end time
 end = time.time()
 print(f'Training took {end-start:.2f} seconds')
+#%%
+# TODO uncomment this
+# _ = celldelta.optimize_fokker_planck(X0, ts, pxt_lr=1e-3, ux_lr=1e-3,
+#                                      px=False, ux=True,
+#                                      n_epochs=500, n_samples=n_samples,
+#                                      verbose=True)
 #%%
 l_fps = losses['l_fp']
 l_pxs = losses['l_nce_px']
@@ -111,6 +121,7 @@ plt.scatter(x_proj[:,0], x_proj[:,1], c=pxts[:,0], cmap=viridis, s=1)
 # Remove the axis ticks 
 plt.xticks([])
 plt.yticks([]);
+
 #%%
 ts_np = ts.detach().cpu().numpy()
 # Plot the pseudotime i.e. the timestep of maximum probability for each cell
@@ -119,6 +130,14 @@ plt.title('Pseudotime, max_t p(x,t)')
 plt.scatter(x_proj[:,0], x_proj[:,1], c=ts_np[pxts.argmax(axis=1)], cmap=viridis, s=1, 
             vmin=ts[0], vmax=ts[-1])
 plt.colorbar()
+#%%
+# Compute the UMAP projection of the data
+umap = UMAP()
+umap_proj = umap.fit_transform(X.cpu().numpy())
+#%%
+plt.scatter(umap_proj[:,0], umap_proj[:,1], c=ts_np[pxts.argmax(axis=1)], cmap=viridis, s=.5)
+plt.colorbar()
+plt.title('UMAP projection, colored by pseudotime')
 #%%
 # Plot the predicted p(x,t) for each cell at each timestep t
 fig, axs = plt.subplots(6,2, figsize=(10,20)) 
@@ -148,7 +167,7 @@ x = X0.clone().detach()
 tsim = torch.linspace(0, 1, 100, device=device, requires_grad=False)
 zero_boundary = True
 
-xts = celldelta.simulate(x, tsim, zero_boundary=zero_boundary, ux_alpha=1)
+xts = celldelta.simulate(x, tsim, zero_boundary=zero_boundary, sigma=0, ux_alpha=50)
 
 #%%
 # Plot trajectory of a single cell

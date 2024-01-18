@@ -32,14 +32,13 @@ X0 = torch.tensor(X0, device=device, dtype=torch.float32)
 
 #%%
 # Plot the two distributions
-_=plt.hist(X0.data.cpu().numpy(), bins=30, alpha=.3, label='X0')
-# _=plt.hist(X1.cpu().numpy(), bins=30, alpha=.3, label='X1')
-_=plt.hist(X.data.cpu().numpy(), bins=30, alpha=.3, label='X')
+_=plt.hist(X0.data.cpu().numpy(), bins=30, alpha=.3, label='X0', density=True)
+_=plt.hist(X.data.cpu().numpy(), bins=30, alpha=.3, label='X', density=True)
 plt.legend()
 
 #%%
-ts = torch.linspace(0, 1, 100, device=device)*100
-epochs = 1000
+ts = torch.linspace(0, 1, 100, device=device)
+epochs = 500
 n_samples = 1000
 hx = 1e-3
 ht = ts[1] - ts[0]
@@ -63,17 +62,21 @@ noise0 = D.MultivariateNormal(mean0, cov0)
 
 #%%
 # Train the model
-losses = celldelta.optimize(X0, X0, ts,
-                            pxt_lr=1e-3, ux_lr=1e-3, 
-                            n_epochs=epochs, n_samples=n_samples, 
-                            px_noise=noise0, p0_noise=noise0,
-                            verbose=True)
-
+losses = celldelta.optimize_initial_conditions(X0, ts, p0_noise=noise0, 
+                                               n_epochs=5000, 
+                                               verbose=True)
+#%%
 losses = celldelta.optimize(X, X0, ts,
                             pxt_lr=1e-3, ux_lr=1e-3, 
                             n_epochs=epochs, n_samples=n_samples, 
-                            px_noise=noise, p0_noise=noise0,
+                            px_noise=noise, p0_noise=noise0, fokker_planck=True,
                             verbose=True)
+#%%
+_ = celldelta.optimize_fokker_planck(X0, ts,
+                                     pxt_lr=1e-3, ux_lr=1e-3,
+                                     px=False, ux=True,
+                                     n_epochs=epochs, n_samples=n_samples,
+                                     verbose=True)
 
 #%%
 l_fps = losses['l_fp']
@@ -179,10 +182,9 @@ fig.legend()
 # Simulate the stochastic differential equation using the Euler-Maruyama method
 # with the learned drift term u(x)
 x = X0.clone().detach()
-tsim = torch.linspace(0, 1, 100, device=device, requires_grad=False)
 zero_boundary = True
-
-xts = celldelta.simulate(x, tsim, zero_boundary=zero_boundary, ux_alpha=100)
+ts.requires_grad = False
+xts = celldelta.simulate(x, ts, zero_boundary=zero_boundary, sigma=0, ux_alpha=1)
 
 #%%
 # Plot the resulting probability densities at each timestep
@@ -190,8 +192,8 @@ low = float(xs.min())
 high = float(xs.max())
 bins = np.linspace(low, high, 60)
 w = bins[1] - bins[0]
-for i in range(0, tsim.shape[0], tsim.shape[0]//10):
-    t=tsim[i]
+for i in range(0, ts.shape[0], ts.shape[0]//10):
+    t=ts[i]
     heights,bins = np.histogram(xts[i,:], 
                                 bins=bins,
                                 density=True)
@@ -207,8 +209,8 @@ plt.title('p(x,t)')
 
 #%%
 # Plot the cumulative distribution of the simulated data at each timestep
-sim_pxts = np.zeros((bins.shape[0]-1, tsim.shape[0]))
-for i in range(0, tsim.shape[0]):
+sim_pxts = np.zeros((bins.shape[0]-1, ts.shape[0]))
+for i in range(0, ts.shape[0]):
     heights,bins = np.histogram(xts[i,:], 
                                 bins=bins,
                                 density=True)
