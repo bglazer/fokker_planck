@@ -1,16 +1,9 @@
 import torch
-from torch import logsumexp
 from torch.nn import Linear, ReLU
 import torch.nn as nn
 import numpy as np
-from scipy.stats import gaussian_kde
-from KDE import GaussianKDE
-from copulas.multivariate.gaussian import GaussianMultivariate
-from torch.distributions import Categorical
-from copy import deepcopy
-#%%
-# Define models 
 
+# Define models 
 class MLP(torch.nn.Module):
     def __init__(self, input_dim, output_dim, hidden_dim, num_layers, input_bias=True):
         """
@@ -35,7 +28,6 @@ class MLP(torch.nn.Module):
             layers.append(ReLU())
             # TODO do we need batch norm here?
         layers.append(Linear(hidden_dim, output_dim, bias=False))
-        # layers.append(LeakyReLU())
         # Register the layers as a module of the model
         self.layers = torch.nn.ModuleList(layers)
 
@@ -61,22 +53,43 @@ class Ux(torch.nn.Module):
         super(Ux, self).__init__()
         # The drift term of the Fokker-Planck equation, modeled by a neural network
         self.model = MLP(input_dim, input_dim, hidden_dim, n_layers)
+        # Initialize the weights and biases of the model to have small magnitude
+        # for layer in self.model.layers:
+        #     if isinstance(layer, Linear):
+        #         torch.nn.init.normal_(layer.weight, mean=0.0, std=1e-5)
+        #         if layer.bias is not None:
+        #             torch.nn.init.constant_(layer.bias, 1e-6)
 
     def forward(self, x):
+        # NOTE this works better in high dimensions when it's negative???
         return self.model(x)
     
-    # TODO batching of analytical differentiation
     def dx(self, x):
         """
-        Compute the derivative of u(x) with respect to x
+        Compute the divergence of u(x) with respect to x. Divergence is the sum of the 
+        partial derivatives of each component of u(x) with respect to each element of x.
+        \sum_{i=1}^{N} du_i(x)/dx_i
         """
-        ux = self.model(x)
-        dudx = torch.autograd.grad(outputs=ux, 
-                                   inputs=x, 
-                                   grad_outputs=torch.ones_like(ux),
-                                   create_graph=True,
-                                   retain_graph=True)[0]
-        return dudx
+        u = self.model(x)
+        div = torch.zeros_like(x[:,0])
+        for i in range(u.shape[1]):
+            div += torch.autograd.grad(u[:,i], x, 
+                                       torch.ones_like(u[:,i]), 
+                                       retain_graph=True, 
+                                       create_graph=True)[0][:,i]
+        return u, div
+    
+    # def dx(self, x):
+    #     """
+    #     Compute the derivative of u(x) with respect to x
+    #     """
+    #     ux = self.model(x)
+    #     dudx = torch.autograd.grad(outputs=ux, 
+    #                                inputs=x, 
+    #                                grad_outputs=torch.ones_like(ux),
+    #                                create_graph=True,
+    #                                retain_graph=True)[0]
+    #     return ux, dudx
 
 
     
@@ -141,7 +154,7 @@ class Pxt(torch.nn.Module):
     
     def dx_dt(self, x, ts):
         """
-        Compute the partial derivative of log p(x,t) with respect to x
+        Compute the partial derivative of log p(x,t) with respect to x and to t
 
         Returns:
             torch.tensor: The partial derivative of log p(x,t) with respect to x
@@ -151,12 +164,13 @@ class Pxt(torch.nn.Module):
         log_pxt = self.model(xts)
         dpdx = torch.autograd.grad(outputs=log_pxt, 
                                    inputs=xts, 
-                                   grad_outputs=torch.ones_like(log_pxt),
+                                   grad_outputs=torch.ones_like(log_pxt), # TODO is this correct?
                                    create_graph=True,
                                    retain_graph=True)[0]
         # The :-1 is to get the gradient with respect to x
-        # The -1 is to get the gradient with respect to t
-        return dpdx[:,:,:-1], dpdx[:,:,-1].unsqueeze(2)
+        # The -1: is to get the gradient with respect to t
+        # TODO Is this correct?
+        return dpdx[...,:-1], dpdx[...,-1:]
     
     def sample(self, x0, n_steps, step_size, eps=None):
         """
@@ -271,39 +285,25 @@ class CellDelta(nn.Module):
         Returns:
             torch.Tensor: The tensor representing loss enforcing constraint to the Fokker-Planck term.
         """
+        # TODO usually this is set at initialization
+        # might be reinitalized to zeros.
+        # TODO validate with a polynomial function, 
+        # TODO make sure this has the correct gradient
+        # TODO maybe we need to scale the gradients by the number of points?
         x.requires_grad = True
         ts.requires_grad = True
-        # Fokker-Planck equation:
-        # d/dt p(x,t) = \sum_{i=1]^{N} d/dx_i [u(x)*p(x,t)]
-        # Let q = logp(x,t), so that we can compute the derivative of the log probability
-        # d/dt q(x,t) = \sum_{i=1}^{N} -[u(x)*dq(x,t)/dx_i + du(x)/dx] 
-        ux = self.ux(x)
-        du_dx = torch.autograd.grad(outputs=ux,
-                                    inputs=x,
-                                    grad_outputs=torch.ones_like(self.ux(x)),
-                                    create_graph=True,
-                                    retain_graph=True)[0]
+        
         dq_dx, dq_dt = self.pxt.dx_dt(x, ts)
+        ux, du_dx = self.ux.dx(x)
 
-        d_dx = (dq_dx * ux + du_dx).sum(dim=2, keepdim=True)
-        d_dt = dq_dt
+        d_dx = ((dq_dx * ux).sum(dim=2) + du_dx)[...,None]
 
         # Enforce that dq_dt = -dx, i.e. that both sides of the fokker planck equation are equal
-        l_fp = ((d_dx + d_dt)**2).mean()
+        l_fp = ((d_dx + dq_dt)**2).mean()
         
+        x.requires_grad = False
+        ts.requires_grad = False
         
-        # px_ux = (self.pxt.model(xts) + self.ux(xts[:,:,:-1]))
-        # px_ux_dx = torch.autograd.grad(outputs=px_ux,
-        #                                inputs=xts, 
-        #                                grad_outputs=torch.ones_like(px_ux),
-        #                                create_graph=True,
-        #                                retain_graph=True)[0]
-        
-        # Calculate the derivative of the log probability with respect to x and t
-        # dq_dt = Left hand side of the Fokker-Planck equation: d/dt q(x,t)
-        # dx = px_ux_dx[:,:,:-1].sum(dim=2, keepdim=True)
-            
-        # l_fp = ((dq_dt + dx)**2).mean()
         return l_fp
 
 
@@ -317,8 +317,8 @@ class CellDelta(nn.Module):
         l_consistency = ((sum_log_pxt - sum_log_px0)**2).mean()
         return l_consistency
 
-    def optimize(self, X, X0, ts, px_noise, p0_noise,
-                 pxt_lr=5e-4, ux_lr=1e-3, fokker_planck=True,  
+    def optimize(self, X, X0, ts, px_noise, p0_noise, p0_alpha=1,
+                 pxt_lr=5e-4, ux_lr=1e-3, fokker_planck_alpha=1,  
                  n_epochs=100, n_samples=1000, verbose=False):
         """
         Optimize the cell delta model parameters using the provided training data.
@@ -329,8 +329,10 @@ class CellDelta(nn.Module):
             ts (torch.tensor): The time points at which to evaluate the model of shape (n_timesteps,).
             px_noise (torch.distributions): The noise distribution to use for the NCE loss for the overall distribution.
             p0_noise (torch.distributions): The noise distribution to use for the NCE loss for the initial conditions.
+            p0_alpha (float, optional): The weight to apply to the initial conditions loss. Defaults to 1.
             pxt_lr (float, optional): The learning rate for the PXT model. Defaults to 5e-4.
             ux_lr (float, optional): The learning rate for the UX model. Defaults to 1e-3.
+            fokker_planck_alpha (bool, optional): The weight to apply to the Fokker-Planck loss term. Defaults to 1.
             n_epochs (int, optional): The number of epochs to train for. Defaults to 100.
             n_samples (int, optional): The number of data samples to use in training for each epoch. Defaults to 1000.
             verbose (bool, optional): Whether to print the optimization progress. Defaults to False.
@@ -370,6 +372,7 @@ class CellDelta(nn.Module):
             
             # Calculate the Noise-Constrastive Loss of the initial distribution
             l_nce_p0, acc_p0 = nce_loss(x0, p0_noise, ts=zero)
+            l_nce_p0 = l_nce_p0 * p0_alpha
             l_nce_p0.backward()
 
             # Calculate the consistency loss
@@ -378,12 +381,9 @@ class CellDelta(nn.Module):
             l_consistency = zero
 
             # Calculate the Fokker-Planck loss
-            if fokker_planck:
-                l_fp = self.fokker_planck_loss(x, ts)
-                l_fp.backward()
-            else:
-                l_fp = zero
-
+            l_fp = self.fokker_planck_loss(x, ts)*fokker_planck_alpha
+            l_fp.backward()
+            
             self.pxt_optimizer.step()
             self.ux_optimizer.step()
 
@@ -400,7 +400,7 @@ class CellDelta(nn.Module):
         return {'l_nce_px': l_nce_pxs, 'l_nce_p0': l_nce_p0s, 'l_fp': l_fps}
     
     def optimize_fokker_planck(self, X, ts, ux=True, px=True,
-                               pxt_lr=5e-4, ux_lr=1e-3,  
+                               pxt_lr=5e-4, ux_lr=1e-3, fokker_planck_alpha=1,
                                n_epochs=100, n_samples=1000, verbose=False):
         """
         Optimize the Fokker-Planck component of the loss independently of the NCE component.
@@ -422,7 +422,7 @@ class CellDelta(nn.Module):
 
             
             # Calculate the Fokker-Planck loss
-            l_fp = self.fokker_planck_loss(x, ts)
+            l_fp = self.fokker_planck_loss(x, ts)*fokker_planck_alpha
             l_fp.backward()
 
             if ux:
@@ -434,7 +434,7 @@ class CellDelta(nn.Module):
             l_fps[epoch] = float(l_fp.mean())
             
             if verbose:
-                print(f'l_fp={float(l_fp):.5f}')
+                print(f'{epoch} l_fp={float(l_fp):.5f}')
                 
         return {'l_fp': l_fps}
     
@@ -479,7 +479,7 @@ class CellDelta(nn.Module):
         xts = torch.zeros((len(tsim), x.shape[0], x.shape[1]), device='cpu')
         ht = tsim[1] - tsim[0]
         zero_boundary = zero_boundary
-        sigma = torch.ones_like(x)*sigma
+        # sigma = torch.ones_like(x)*sigma
         
         for i in range(len(tsim)):
             # Compute the drift term
@@ -489,10 +489,10 @@ class CellDelta(nn.Module):
             dW = torch.randn_like(x) * torch.sqrt(ht)
             # Compute the change in x
             dx = u * ht + sigma * dW
-            dx = dx.squeeze(0)
+            # dx = dx.squeeze(0)
             # Update x
             x = x + dx
             if zero_boundary:
-                x[x < 0] = 0
+                x[x < 0] = 0.0
             xts[i,:,:] = x.cpu().detach()
         return xts

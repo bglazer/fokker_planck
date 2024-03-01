@@ -37,12 +37,9 @@ _=plt.hist(X.data.cpu().numpy(), bins=30, alpha=.3, label='X', density=True)
 plt.legend()
 
 #%%
-ts = torch.linspace(0, 1, 100, device=device)
+ts = torch.linspace(0, 1, 100, device=device)*100
 epochs = 500
 n_samples = 1000
-hx = 1e-3
-ht = ts[1] - ts[0]
-zero = torch.zeros(1).to(device)
 
 #%%
 # Initialize the model
@@ -63,13 +60,15 @@ noise0 = D.MultivariateNormal(mean0, cov0)
 #%%
 # Train the model
 losses = celldelta.optimize_initial_conditions(X0, ts, p0_noise=noise0, 
-                                               n_epochs=5000, 
+                                               n_epochs=1000, 
                                                verbose=True)
 #%%
+p0_alpha = 10
 losses = celldelta.optimize(X, X0, ts,
                             pxt_lr=1e-3, ux_lr=1e-3, 
-                            n_epochs=epochs, n_samples=n_samples, 
-                            px_noise=noise, p0_noise=noise0, fokker_planck=True,
+                            n_epochs=1000, n_samples=n_samples, 
+                            px_noise=noise, p0_noise=noise0, fokker_planck_alpha=1,
+                            p0_alpha=p0_alpha, 
                             verbose=True)
 #%%
 _ = celldelta.optimize_fokker_planck(X0, ts,
@@ -113,7 +112,7 @@ uxs = celldelta.ux(xs).squeeze().cpu().detach().numpy()
 # pxt_dts = pxt_dts.detach().cpu().numpy()[:,:,0]
 
 xs = xs.squeeze().cpu().detach().numpy()
-#%%
+
 # Plot the predicted p(x,t) at each timestep t
 plt.title('p(x,t)')
 x_density, x_bins = np.histogram(X.detach().cpu().numpy(), bins=30, density=True)
@@ -197,7 +196,7 @@ for i in range(0, ts.shape[0], ts.shape[0]//10):
     heights,bins = np.histogram(xts[i,:], 
                                 bins=bins,
                                 density=True)
-    plt.bar(bins[:-1], heights, width=w, color=viridis(float(t)), alpha=.2)
+    plt.bar(bins[:-1], heights, width=w, color=viridis(float(t)/max(ts).item()), alpha=.2)
 
 for i in range(0, pxts.shape[1], pxts.shape[1]//10):
     plt.plot(xs, pxts[:,i], color='blue', alpha=.2)
@@ -229,12 +228,7 @@ plt.colorbar()
 #%%
 # Plot the final cumulative distribution of simulations versus the data distribution
 plt.title('Final cumulative distribution of simulations vs data distribution')
-# Remove timesteps where the simulation diverged
-# i.e. the simulation went outside the range of the data (>2stds away from the data mean)
-std = X.detach().cpu().numpy().std()*2
-good_runs = ((np.abs(xts - X.detach().cpu().numpy().mean()) > std).sum(axis=0) == 0)
-print(f'Fraction of good runs: {good_runs.sum()/good_runs.shape[0]:.2f}')
-sim_mean_dist, sim_mean_bins = np.histogram(xts[:,good_runs].flatten(), bins=30, density=True)
+sim_mean_dist, sim_mean_bins = np.histogram(xts.flatten(), bins=data_bins, density=True)
 w = sim_mean_bins[1] - sim_mean_bins[0]
 plt.bar(sim_mean_bins[:-1], sim_mean_dist, width=w, alpha=.3, label='Simulation')
 
