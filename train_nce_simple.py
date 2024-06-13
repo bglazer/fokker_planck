@@ -38,12 +38,13 @@ bins = 100
 x = torch.linspace(-5, 10, bins).unsqueeze(1).to(device)
 log_density_x = model(x)
 p_x = torch.exp(log_density_x)
-plt.plot(x.cpu().numpy(), p_x.cpu().detach().numpy())
+plt.plot(x.cpu().numpy(), p_x.cpu().detach().numpy()/p_x.sum().item(), c='orange', label='Predicted Density')
 # plt.plot(x.cpu().numpy(), log_density_x.cpu().detach().numpy())
 height, bins = np.histogram(target.cpu().numpy(), bins=bins)
 height = height / height.sum()
 w = bins[1] - bins[0]
-plt.bar(x=bins[:-1], width=w, height=height, alpha=0.5)
+plt.bar(x=bins[:-1], width=w, height=height, alpha=0.5, label='Data Density')
+plt.legend()
 
 #%% 
 # Now a more complex example, with a 100-dimensional target distribution
@@ -186,5 +187,71 @@ plt.hist(p_test, bins=100, alpha=.5, label='test', density=True);
 plt.hist(noise_prob_np, bins=100, alpha=.5, label='noise', density=True);
 plt.legend()
 
+
+# %%
+# %%
+######################
+# TWO MOONS
+######################
+# Generate the two half moons dataset
+from sklearn.datasets import make_moons
+Xnp, y = make_moons(n_samples=1000, noise=.05)
+X = torch.tensor(Xnp, device=device, dtype=torch.float32, requires_grad=False)
+# Plot the distribution
+plt.scatter(Xnp[:,0], Xnp[:,1], c=y, s=3, alpha=1)
+# %%
+# Train the model
+dim=2
+mean = X.mean(dim=0)
+cov = np.cov(X.detach().cpu().numpy().T)
+cov = cov + np.eye(dim)*1e-3
+cov = torch.tensor(cov, dtype=torch.float32).to(device)
+noise = D.MultivariateNormal(mean, cov)
+model = NCE(noise=noise, dim=X.shape[1], hidden_dim=64, num_layers=2).to(device)
+
+model.optimize(X, n_epochs=1000, n_samples=1000, lr=1e-3)
+
+# %%
+# Plot contours of log probability
+# Make a meshgrid of the axes
+x = np.linspace(Xnp.min(), Xnp.max(), 200)
+y = np.linspace(Xnp.min(), Xnp.max(), 200)
+xx, yy = np.meshgrid(x, y)
+# Get the log_prob of every x,y pair
+xy = torch.tensor(np.vstack((xx.flatten(), yy.flatten())).T, device=device, dtype=torch.float32)
+log_prob = model(xy)
+# Normalize the log_probs
+# log_prob = log_prob - torch.logsumexp(log_prob, dim=0)
+log_prob_np = log_prob.cpu().detach().numpy()
+prob = np.exp(log_prob_np)
+fig, axs = plt.subplots(1, 2, figsize=(10,5))
+# Give both axes the same dimensions
+axs[0].set_xlim(x.min(), x.max())
+axs[0].set_ylim(y.min(), y.max())
+axs[1].set_xlim(axs[0].get_xlim())
+axs[1].set_ylim(axs[0].get_ylim())
+# axs[0].contourf(xx, yy, np.exp(log_prob_np.reshape(xx.shape)), alpha=.5, levels=30)
+axs[0].contourf(xx, yy, prob.reshape(xx.shape), alpha=.5, levels=30)
+# axs[0].scatter(Xnp[:,0], Xnp[:,1], alpha=.3, s=1, c='k')
+# Count the number of points in each bin
+xheight, xbin, ybin = np.histogram2d(Xnp[:,0], Xnp[:,1], 
+                                    range=[[x.min(), x.max()], 
+                                           [y.min(), y.max()]],
+                                    bins=50)
+xheight = xheight / xheight.sum()
+xheight = xheight+1e-6
+# Plot the contour
+axs[1].contourf(xbin[:-1], ybin[:-1], np.log(xheight.T+1e-8), alpha=.5, levels=15)
+axs[1].scatter(Xnp[:,0], Xnp[:,1], alpha=.3, s=1, c='k')
+axs[0].set_title('Model Density', fontsize=18)
+axs[1].set_title('Data Density', fontsize=18)
+
+# %%
+# Plot the data from the two moons
+noise_sample = noise.sample((5000,))
+plt.scatter(noise_sample[:,0].cpu().numpy(), noise_sample[:,1].cpu().numpy(), s=1, c='r', alpha=.5)
+plt.scatter(Xnp[:,0], Xnp[:,1], c='blue', s=3, alpha=1)
+plt.xticks([])
+plt.yticks([])
 
 # %%

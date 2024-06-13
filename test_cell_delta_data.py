@@ -14,14 +14,14 @@ import torch.distributions as D
 from umap import UMAP
 
 #%%
-device = 'cuda:1'
+device = 'cuda:0'
 
 #%%
 genotype='wildtype'
 dataset = 'net'
 adata = sc.read_h5ad(f'{genotype}_{dataset}.h5ad')
 nmp_cell_mask = adata.obs['cell_type'] == 'NMP'
-n_genes = 2
+n_genes = 50
 X = adata.X.toarray()
 X = torch.tensor(X, device=device, dtype=torch.float32)
 # Get a boolean mask for the top n_genes by variance
@@ -235,6 +235,8 @@ xts_proj = pca.transform(xts_flat)
 # plt.scatter(x_proj[:,0], x_proj[:,1], c=ts_np[pxts.argmax(axis=1)], cmap='b', alpha=.1, s=1)
 plt.scatter(xts_proj[:,0], xts_proj[:,1], s=.5, alpha=.5)
 plt.scatter(x_proj[:,0], x_proj[:,1], c='black', cmap=viridis, alpha=.1, s=1)
+plt.xticks([])
+plt.yticks([])
 
 #%%
 # Plot the sum of the p(x,t) at each timestep

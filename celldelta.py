@@ -150,7 +150,7 @@ class Pxt(torch.nn.Module):
         """
         Marginalize out the t dimension to get log(p(x))
         """
-        return torch.logsumexp(self.log_pxt(x, ts), dim=0) - torch.log(torch.tensor(ts.shape[0], device=x.device, dtype=torch.float32))
+        return torch.logsumexp(self.log_pxt(x, ts), dim=0) #- torch.log(torch.tensor(ts.shape[0], device=x.device, dtype=torch.float32))
     
     def dx_dt(self, x, ts):
         """
@@ -233,7 +233,7 @@ class CellDelta(nn.Module):
         # Add the component models (ux, pxt, nce) to a module list
         self.models = torch.nn.ModuleDict({'ux':self.ux, 'pxt':self.pxt})
     
-    def nce_loss(self, x, noise, ts):
+    def nce_loss(self, x, noise, ts, scale):
         """
         Compute the Noise-Contrastive Estimation (NCE) loss for the given data.
 
@@ -247,9 +247,10 @@ class CellDelta(nn.Module):
         """
         y = noise.sample((x.shape[0],))
 
-        logp_x = self.pxt.log_px(x, ts)  # logp(x)
+        log_scale = torch.log(torch.tensor(scale))
+        logp_x = self.pxt.log_px(x, ts) + log_scale # logp(x)
         logq_x = noise.log_prob(x).unsqueeze(1) # logq(x)
-        logp_y = self.pxt.log_px(y, ts)  # logp(y)
+        logp_y = self.pxt.log_px(y, ts) + log_scale # logp(y)
         logq_y = noise.log_prob(y).unsqueeze(1) # logq(y)
 
         value_x = logp_x - torch.logaddexp(logp_x, logq_x)  # logp(x)/(logp(x) + logq(x))
@@ -275,12 +276,10 @@ class CellDelta(nn.Module):
         u(x): The drift function
         dq_dx: The derivative of the log probability with respect to x.
         du_dx: The derivative of the drift term with respect to x.
+        
         Args:
             x (torch.Tensor): The input data of shape (n_cells, n_genes).
             ts (torch.Tensor): The time points at which to evaluate the model of shape (n_timesteps,).
-            u (torch.Tensor): The tensor representing the potential energy.
-            dq_dx (torch.Tensor): The tensor representing the derivative of the log probability with respect to x.
-            du_dx (torch.Tensor): The tensor representing the derivative of the potential energy with respect to x.
 
         Returns:
             torch.Tensor: The tensor representing loss enforcing constraint to the Fokker-Planck term.
@@ -316,7 +315,15 @@ class CellDelta(nn.Module):
         sum_log_px0 = self.pxt.log_pxt(x, zero).mean(dim=1).detach()
         l_consistency = ((sum_log_pxt - sum_log_px0)**2).mean()
         return l_consistency
-
+    
+    def ux_magnitude_loss(self, x):
+        """
+        Enforce that the magnitude of the drift term is not too large
+        """
+        ux = self.ux(x)
+        l_ux = (ux**2).mean()
+        return l_ux
+    
     def optimize(self, X, X0, ts, px_noise, p0_noise, p0_alpha=1,
                  pxt_lr=5e-4, ux_lr=1e-3, fokker_planck_alpha=1,  
                  n_epochs=100, n_samples=1000, verbose=False):
@@ -340,7 +347,7 @@ class CellDelta(nn.Module):
         Returns:
             dict: A dictionary containing the loss values for each epoch.
         """
-        nce_loss = self.nce_loss
+        # nce_loss = self.nce_loss
 
         self.pxt_optimizer = torch.optim.Adam(self.pxt.parameters(), lr=pxt_lr)
         self.ux_optimizer = torch.optim.Adam(self.ux.parameters(), lr=ux_lr)
@@ -365,21 +372,34 @@ class CellDelta(nn.Module):
 
             # Calculate the Noise-Constrastive Loss of the distribution
             # of p(x,t) marginalized over t: p(x) = \int p(x,t) dt
-            l_nce_px, acc_px = nce_loss(x, px_noise, ts=ts)
+            l_nce_px, acc_px = self.nce_loss(x, px_noise, ts=ts, scale=1/ts.shape[0])
             l_nce_px.backward()
             # l_nce_px = zero
             # acc_px = zero
             
             # Calculate the Noise-Constrastive Loss of the initial distribution
-            l_nce_p0, acc_p0 = nce_loss(x0, p0_noise, ts=zero)
+            l_nce_p0, acc_p0 = self.nce_loss(x0, p0_noise, ts=zero, scale=1)
             l_nce_p0 = l_nce_p0 * p0_alpha
             l_nce_p0.backward()
 
             # Calculate the consistency loss
             # l_consistency = self.consistency_loss(x, ts)
             # l_consistency.backward()
-            l_consistency = zero
+            # l_consistency = zero
 
+            # Penalize the magnitude of the drift term
+            # l_ux = self.ux_magnitude_loss(x)
+            # l_ux.backward()
+            l_ux = zero
+
+            # Add a weight decay penalty on the drift and p(x,t) models
+            # l_ux_weights = self.ux_l2_loss()
+            # l_pxt_weights = self.pxt_l2_loss()
+            # l_ux_weights.backward()
+            # l_pxt_weights.backward()
+            l_ux_weights = zero
+            l_pxt_weights = zero
+                        
             # Calculate the Fokker-Planck loss
             l_fp = self.fokker_planck_loss(x, ts)*fokker_planck_alpha
             l_fp.backward()
@@ -394,13 +414,16 @@ class CellDelta(nn.Module):
             
             if verbose:
                 print(f'{epoch} l_nce_px={float(l_nce_px):.5f}, acc_px={float(acc_px):.5f}, '
-                    f'l_nce_p0={float(l_nce_p0):.5f}, acc_p0={float(acc_p0):.5f},'
-                    f'l_fp={float(l_fp):.5f} l_consistency={float(l_consistency):.5f}')
+                    f'l_nce_p0={float(l_nce_p0):.5f}, acc_p0={float(acc_p0):.5f}, '
+                    f'l_fp={float(l_fp):.5f}, '
+                    # f'l_ux_weights={float(l_ux):.5f}, l_pxt_weights={float(l_pxt_weights):.5f}'
+                    )
                 
         return {'l_nce_px': l_nce_pxs, 'l_nce_p0': l_nce_p0s, 'l_fp': l_fps}
     
     def optimize_fokker_planck(self, X, ts, ux=True, px=True,
                                pxt_lr=5e-4, ux_lr=1e-3, fokker_planck_alpha=1,
+                               noise=None,
                                n_epochs=100, n_samples=1000, verbose=False):
         """
         Optimize the Fokker-Planck component of the loss independently of the NCE component.
@@ -412,15 +435,22 @@ class CellDelta(nn.Module):
         
         n_samples = min(n_samples, len(X))
 
+        if noise is not None:
+            # Create a Gaussian distribution
+            normal = torch.distributions.Normal(loc=torch.zeros(n_samples,device=self.device), 
+                                                scale=torch.ones(n_samples,device=self.device)*noise)
+
         for epoch in range(n_epochs):
             # Sample from the data distribution
             rand_idxs = torch.randperm(len(X))[:n_samples]
             x = X[rand_idxs].clone().detach()
+            if noise is not None:
+                # Add Gaussian noise to the data
+                x = x + normal.sample().unsqueeze(1)
 
             self.pxt_optimizer.zero_grad()
             self.ux_optimizer.zero_grad()
 
-            
             # Calculate the Fokker-Planck loss
             l_fp = self.fokker_planck_loss(x, ts)*fokker_planck_alpha
             l_fp.backward()
@@ -456,7 +486,7 @@ class CellDelta(nn.Module):
             self.pxt_optimizer.zero_grad()
             
             # Fit every time to the initial conditions
-            l_nce_p0, acc_p0 = nce_loss(X0, p0_noise, ts=t)
+            l_nce_p0, acc_p0 = nce_loss(X0, p0_noise, ts=t, scale=1/ts.shape[0])
             l_nce_p0.backward()
 
             self.pxt_optimizer.step()
@@ -468,7 +498,7 @@ class CellDelta(nn.Module):
                 print(f'{epoch} l_nce_p0={float(l_nce_p0):.5f}, acc_p0={float(acc_p0):.5f}')
                 
         return {'l_nce_p0': l_nce_p0s}
-                                    
+                                      
 
     def simulate(self, X0, tsim, ux_alpha=1, sigma=1, zero_boundary=True):
         """

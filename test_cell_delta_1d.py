@@ -101,7 +101,7 @@ high = float(X.max())
 l = low-.25*(high-low) 
 h = high+.25*(high-low)
 xs = torch.arange(0, h, .01, device=device)[:,None]
-
+#%%
 pxts = np.exp(celldelta.pxt.log_pxt(xs, ts).squeeze().T.cpu().detach().numpy())
 uxs = celldelta.ux(xs).squeeze().cpu().detach().numpy()
 
@@ -117,8 +117,8 @@ xs = xs.squeeze().cpu().detach().numpy()
 plt.title('p(x,t)')
 x_density, x_bins = np.histogram(X.detach().cpu().numpy(), bins=30, density=True)
 w = x_bins[1] - x_bins[0]
-plt.bar(height=x_density, x=x_bins[:-1], width=w, alpha=.3, label='X')
-plt.hist(X0.detach().cpu().numpy(), bins=30, alpha=.3, label='X0', density=True, color='orange')
+plt.bar(height=x_density, x=x_bins[:-1], width=w, alpha=.3, label='X', color='orange')
+plt.hist(X0.detach().cpu().numpy(), bins=30, alpha=.3, label='X0', density=True, color='blue')
 # Get a list of timesteps to plot, with first and last timestep included
 for i in np.linspace(0, len(ts)-1, 10, dtype=int):
     t = ts[i]
@@ -130,7 +130,7 @@ plt.ylabel('p(x,t)')
 sm = plt.cm.ScalarMappable(cmap=viridis, norm=plt.Normalize(vmin=0, vmax=1))
 sm.set_array([])
 plt.colorbar(sm, label='timestep (t)')
-
+plt.legend()
 #%%
 # Plot the Fokker Planck terms
 # for i in range(0,len(ts),len(ts)//10):
@@ -236,4 +236,9 @@ plt.bar(data_bins[:-1], data_dist, width=w, alpha=.3, label='Data')
 plt.ylabel('p(x)')
 plt.xlabel(f'Expression {gene}')
 plt.legend();
+# %%
+# Plot the marginalized p(x) for each x
+plt.bar(data_bins[:-1], data_dist, width=w, alpha=.5, label='Data', color='green')
+plt.bar(xs, height=pxts.mean(axis=1), width=.01, alpha=.4, label='Estimated', color='purple')
+plt.legend()
 # %%

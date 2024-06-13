@@ -29,40 +29,59 @@
 import torch
 from celldelta import CellDelta
 
-x = torch.ones(1)*3
-x.requires_grad=True
+X = torch.ones((1,1))*3
+X.requires_grad=True
 ts = torch.linspace(0, 1, 10, requires_grad=True)
+noise = torch.distributions.MultivariateNormal(loc=torch.ones(1)*2, 
+                             covariance_matrix=torch.eye(1)*6)
 
-cd = CellDelta(1, 1, 1, noise=None, ux_dropout=0, pxt_dropout=0, device='cpu')
+cd = CellDelta(input_dim=1, 
+               ux_hidden_dim=10, ux_layers=2, ux_dropout=0,
+               pxt_hidden_dim=10, pxt_layers=2, pxt_dropout=0,
+               noise=noise, device='cpu',)
 cd.ux_optimizer = torch.optim.Adam(cd.ux.parameters(), lr=0.001)
+cd.pxt_optimizer = torch.optim.Adam(cd.ux.parameters(), lr=0.001)
 hx = 1e-3
 
 #%%
-for i in range(100):
-    xs = x.repeat((ts.shape[0],1,1))
-    ts_ = ts.repeat((x.shape[0],1)).T.unsqueeze(2)
-    # Concatentate them together to match the input the MLP model
-    xts = torch.concatenate((xs,ts_), dim=2)
-    up_pxt = cd.ux(x)*torch.exp(cd.pxt.model(xts))
-    # xts.requires_grad=True
-    up_dx = torch.autograd.grad(outputs=up_pxt, 
-                                inputs=xts, 
-                                grad_outputs=torch.ones_like(up_pxt),
-                                create_graph=True)[0]
-    up_dx = up_dx[:,:,:-1].sum(dim=2, keepdim=True)
-    up_dx_num = (cd.ux(x+hx) * cd.pxt.pxt(x+hx, ts) - \
-                 cd.ux(x-hx) * cd.pxt.pxt(x-hx, ts))/(2*hx)
-    pxt = torch.exp(cd.pxt.model(xts))
-    pxt_dts = torch.autograd.grad(outputs=pxt,
-                                  inputs=xts,
-                                  grad_outputs=torch.ones_like(pxt),
-                                  create_graph=True)[0]
-    pxt_dts = pxt_dts[:,:,-1]
-    pxt_dts_num = cd.pxt.dt(x, ts)
-    l_fp = ((pxt_dts + up_dx)**2).mean()
-    l_fp.backward()
+n_samples = 10
+for epoch in range(10):
+    rand_idxs = torch.randperm(len(x))
+    x = X[rand_idxs].clone().detach()
+    x.requires_grad=True
+    # x = X[rand_idxs]
+    # x0 = X
+    cd.pxt_optimizer.zero_grad()
+    cd.ux_optimizer.zero_grad()
 
-    mse_pxt_num = ((pxt_dts-pxt_dts_num.squeeze(2))**2).mean()
-    mse_up_dx_num = ((up_dx.squeeze(2)-up_dx_num.squeeze(2))**2).mean()
-    print(float(x), l_fp.item(), float(mse_pxt_num), float(mse_up_dx_num))
+    l_nce_p, acc_p = cd.nce_loss(x, ts=ts)
+    l_nce_p.backward()
+
+    l_nce_p0, acc_p = cd.nce_loss(x, ts=torch.zeros(1))
+    l_nce_p0.backward()
+
+    xts = cd.pxt.xts(x, ts)
+    log_pxt = cd.pxt.model(xts)
+    dq = torch.autograd.grad(outputs=log_pxt, 
+                            inputs=xts, 
+                            grad_outputs=torch.ones_like(log_pxt),
+                            create_graph=True,
+                            )[0]
+    dqdx = dq[:,:,:-1]
+    dqdt = dq[:,:,-1].unsqueeze(2)
+    ux = cd.ux.model(x)
+    dudx = torch.autograd.grad(outputs=ux, 
+                            inputs=x, 
+                            grad_outputs=torch.ones_like(ux),
+                            create_graph=True,
+                            )[0]
+    dxi = ux*dqdx + dudx
+    dx = dxi.sum(dim=2, keepdim=True)
+
+    l_fp = ((dqdt + dx)**2).mean()
+    print(epoch)
+    l_fp.backward()
+    print(float(l_fp))
+    cd.pxt_optimizer.step()
     cd.ux_optimizer.step()
+# %%
