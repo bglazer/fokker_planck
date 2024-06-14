@@ -295,6 +295,7 @@ class CellDelta(nn.Module):
         dq_dx, dq_dt = self.pxt.dx_dt(x, ts)
         ux, du_dx = self.ux.dx(x)
 
+        # TODO is (dq_dx*ux).sum(dim=2) correct? Maybe not the right way to sum the derivatives
         d_dx = ((dq_dx * ux).sum(dim=2) + du_dx)[...,None]
 
         # Enforce that dq_dt = -dx, i.e. that both sides of the fokker planck equation are equal
@@ -349,8 +350,8 @@ class CellDelta(nn.Module):
         """
         # nce_loss = self.nce_loss
 
-        self.pxt_optimizer = torch.optim.Adam(self.pxt.parameters(), lr=pxt_lr)
-        self.ux_optimizer = torch.optim.Adam(self.ux.parameters(), lr=ux_lr)
+        self.pxt_optimizer = torch.optim.Adam(self.pxt.parameters(), lr=pxt_lr, weight_decay=1e-5)
+        self.ux_optimizer = torch.optim.Adam(self.ux.parameters(), lr=ux_lr, weight_decay=1e-5)
 
         # Convenience variable for the time t=0
         zero = torch.zeros(1).to(self.device)
@@ -475,7 +476,8 @@ class CellDelta(nn.Module):
         """
         nce_loss = self.nce_loss
 
-        self.pxt_optimizer = torch.optim.Adam(self.pxt.parameters(), lr=pxt_lr)
+        self.pxt_optimizer = torch.optim.Adam(self.pxt.parameters(), lr=pxt_lr,
+                                              weight_decay=1e-6)
 
         l_nce_p0s = np.zeros(n_epochs)
         
