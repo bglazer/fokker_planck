@@ -64,7 +64,7 @@ class Ux(torch.nn.Module):
         # NOTE this works better in high dimensions when it's negative???
         return self.model(x)
     
-    def dx(self, x):
+    def div(self, x):
         """
         Compute the divergence of u(x) with respect to x. Divergence is the sum of the 
         partial derivatives of each component of u(x) with respect to each element of x.
@@ -78,20 +78,6 @@ class Ux(torch.nn.Module):
                                        retain_graph=True, 
                                        create_graph=True)[0][:,i]
         return u, div
-    
-    # def dx(self, x):
-    #     """
-    #     Compute the derivative of u(x) with respect to x
-    #     """
-    #     ux = self.model(x)
-    #     dudx = torch.autograd.grad(outputs=ux, 
-    #                                inputs=x, 
-    #                                grad_outputs=torch.ones_like(ux),
-    #                                create_graph=True,
-    #                                retain_graph=True)[0]
-    #     return ux, dudx
-
-
     
 # The p(x,t) term of the Fokker-Planck equation, modeled by a neural network
 class Pxt(torch.nn.Module):
@@ -152,6 +138,22 @@ class Pxt(torch.nn.Module):
         """
         return torch.logsumexp(self.log_pxt(x, ts), dim=0) #- torch.log(torch.tensor(ts.shape[0], device=x.device, dtype=torch.float32))
     
+    def div_x(self, x, ts):
+        """
+        Compute the divergence of p(x,t) with respect to x. Divergence is the sum of the 
+        partial derivatives of each component of p(x,t) with respect to each element of x.
+        \sum_{i=1}^{N} dp(x,t)/dx_i
+        """
+        xts = self.xts(x, ts)
+        log_pxt = self.model(xts)
+        div = torch.zeros_like(x[:,0])
+        for i in range(u.shape[1]):
+            div += torch.autograd.grad(log_pxt[:,i], x, 
+                                       torch.ones_like(log_pxt[:,i]), 
+                                       retain_graph=True, 
+                                       create_graph=True)[0][:,i]
+        return div
+
     def dx_dt(self, x, ts):
         """
         Compute the partial derivative of log p(x,t) with respect to x and to t
@@ -167,9 +169,9 @@ class Pxt(torch.nn.Module):
                                    grad_outputs=torch.ones_like(log_pxt), # TODO is this correct?
                                    create_graph=True,
                                    retain_graph=True)[0]
+        # The last element of the gradient is the derivative with respect to t
         # The :-1 is to get the gradient with respect to x
-        # The -1: is to get the gradient with respect to t
-        # TODO Is this correct?
+        # The -1: is to get the gradient with respect to t       
         return dpdx[...,:-1], dpdx[...,-1:]
     
     def sample(self, x0, n_steps, step_size, eps=None):
@@ -293,10 +295,10 @@ class CellDelta(nn.Module):
         ts.requires_grad = True
         
         dq_dx, dq_dt = self.pxt.dx_dt(x, ts)
-        ux, du_dx = self.ux.dx(x)
+        ux, div_ux = self.ux.div(x)
 
         # TODO is (dq_dx*ux).sum(dim=2) correct? Maybe not the right way to sum the derivatives
-        d_dx = ((dq_dx * ux).sum(dim=2) + du_dx)[...,None]
+        d_dx = ((dq_dx * ux).sum(dim=2) + div_ux)[...,None]
 
         # Enforce that dq_dt = -dx, i.e. that both sides of the fokker planck equation are equal
         l_fp = ((d_dx + dq_dt)**2).mean()
@@ -305,25 +307,6 @@ class CellDelta(nn.Module):
         ts.requires_grad = False
         
         return l_fp
-
-
-    def consistency_loss(self, x, ts):
-        """
-        Enforce that the p(x,t_i) ~= p(x,t_0) for all t_i in ts
-        """
-        zero = torch.zeros(1).to(self.device)
-        sum_log_pxt = self.pxt.log_pxt(x, ts).mean(dim=1)
-        sum_log_px0 = self.pxt.log_pxt(x, zero).mean(dim=1).detach()
-        l_consistency = ((sum_log_pxt - sum_log_px0)**2).mean()
-        return l_consistency
-    
-    def ux_magnitude_loss(self, x):
-        """
-        Enforce that the magnitude of the drift term is not too large
-        """
-        ux = self.ux(x)
-        l_ux = (ux**2).mean()
-        return l_ux
     
     def optimize(self, X, X0, ts, px_noise, p0_noise, p0_alpha=1,
                  pxt_lr=5e-4, ux_lr=1e-3, fokker_planck_alpha=1,  
@@ -375,32 +358,12 @@ class CellDelta(nn.Module):
             # of p(x,t) marginalized over t: p(x) = \int p(x,t) dt
             l_nce_px, acc_px = self.nce_loss(x, px_noise, ts=ts, scale=1/ts.shape[0])
             l_nce_px.backward()
-            # l_nce_px = zero
-            # acc_px = zero
             
             # Calculate the Noise-Constrastive Loss of the initial distribution
             l_nce_p0, acc_p0 = self.nce_loss(x0, p0_noise, ts=zero, scale=1)
             l_nce_p0 = l_nce_p0 * p0_alpha
             l_nce_p0.backward()
-
-            # Calculate the consistency loss
-            # l_consistency = self.consistency_loss(x, ts)
-            # l_consistency.backward()
-            # l_consistency = zero
-
-            # Penalize the magnitude of the drift term
-            # l_ux = self.ux_magnitude_loss(x)
-            # l_ux.backward()
-            l_ux = zero
-
-            # Add a weight decay penalty on the drift and p(x,t) models
-            # l_ux_weights = self.ux_l2_loss()
-            # l_pxt_weights = self.pxt_l2_loss()
-            # l_ux_weights.backward()
-            # l_pxt_weights.backward()
-            l_ux_weights = zero
-            l_pxt_weights = zero
-                        
+                       
             # Calculate the Fokker-Planck loss
             l_fp = self.fokker_planck_loss(x, ts)*fokker_planck_alpha
             l_fp.backward()
@@ -488,7 +451,7 @@ class CellDelta(nn.Module):
             self.pxt_optimizer.zero_grad()
             
             # Fit every time to the initial conditions
-            l_nce_p0, acc_p0 = nce_loss(X0, p0_noise, ts=t, scale=1/ts.shape[0])
+            l_nce_p0, acc_p0 = nce_loss(X0, p0_noise, ts=t, scale=1)#/ts.shape[0])
             l_nce_p0.backward()
 
             self.pxt_optimizer.step()
