@@ -291,41 +291,6 @@ class CellDelta(nn.Module):
         
         return l_fp
     
-    def dq_dx_penalty(self, x, ts):
-        """
-        Compute the penalty for the gradient of the log probability with respect to x.
-        """
-        x.requires_grad = True
-        ts.requires_grad = True
-        
-        dq_dx, _ = self.pxt.dx_dt(x, ts)
-        # Compute the penalty for the gradient of the log probability with respect to x
-        penalty = (dq_dx**2).mean()
-        
-        x.requires_grad = False
-        ts.requires_grad = False
-        
-        return penalty
-    
-    def div_ux_penalty(self, x):
-        """
-        Penalize the divergence of the drift term.
-        """
-        x.requires_grad = True
-        ux, div_ux = self.ux.div(x)
-        x.requires_grad = False
-        penalty = (div_ux**2).mean()
-        
-        return penalty
-    
-    def ux0_penalty(self, x):
-        """
-        Penalize low values of the drift term at the initial conditions.
-        """
-        penalty = -torch.log((self.ux(x)**2).mean())
-        
-        return penalty
-    
     def optimize(self, X, X0, ts, px_noise, p0_noise, p0_alpha=1,
                  pxt_lr=5e-4, ux_lr=1e-3, fokker_planck_alpha=1, 
                  div_alpha=1, dq_dx_alpha=1,
@@ -390,16 +355,6 @@ class CellDelta(nn.Module):
             l_fp0 = self.fokker_planck_loss(x, ts[:1])*fokker_planck_alpha
             l_fp0.backward()
 
-            # l_dq_dx = self.dq_dx_penalty(x, ts)*dq_dx_alpha
-            # l_dq_dx.backward()
-
-            # l_dq_dx0 = self.dq_dx_penalty(x0, zero)*dq_dx_alpha
-            # l_dq_dx0.backward()
-
-            # # Penalize the divergence of the drift term
-            # l_div_ux = self.div_ux_penalty(x0)*div_alpha
-            # l_div_ux.backward()
-
             self.pxt_optimizer.step()
             self.ux_optimizer.step()
 
@@ -413,9 +368,6 @@ class CellDelta(nn.Module):
                     f'l_nce_p0={float(l_nce_p0):.5f}, acc_p0={float(acc_p0):.5f}, '
                     f'l_fp={float(l_fp):.5f}, '
                     f'l_fp0={float(l_fp0):.5f}, '
-                    # f'l_dq_dqx={float(l_dq_dx):.5f}, '
-                    # f'l_dq_dqx0={float(l_dq_dx0):.5f}, '
-                    # f'l_div_ux={float(l_div_ux):.5f} '
                     )
                 
         return {'l_nce_px': l_nce_pxs, 'l_nce_p0': l_nce_p0s, 'l_fp': l_fps}
@@ -520,7 +472,7 @@ class CellDelta(nn.Module):
         return l
                                       
 
-    def simulate(self, X0, tsim, ux_alpha=1, sigma=1, zero_boundary=True):
+    def simulate(self, X0, tsim, sigma=1, zero_boundary=True):
         """
         Simulate the stochastic differential equation using the Euler-Maruyama method
         with the learned drift term u(x)
@@ -533,7 +485,7 @@ class CellDelta(nn.Module):
         
         for i in range(len(tsim)):
             # Compute the drift term
-            u = self.ux(x)*ux_alpha
+            u = self.ux(x)
             # Compute the diffusion term
             # Generate a set of random numbers
             dW = torch.randn_like(x) * torch.sqrt(ht)
