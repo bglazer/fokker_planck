@@ -136,23 +136,7 @@ class Pxt(torch.nn.Module):
         """
         Marginalize out the t dimension to get log(p(x))
         """
-        return torch.logsumexp(self.log_pxt(x, ts), dim=0) #- torch.log(torch.tensor(ts.shape[0], device=x.device, dtype=torch.float32))
-    
-    def div_x(self, x, ts):
-        """
-        Compute the divergence of p(x,t) with respect to x. Divergence is the sum of the 
-        partial derivatives of each component of p(x,t) with respect to each element of x.
-        \sum_{i=1}^{N} dp(x,t)/dx_i
-        """
-        xts = self.xts(x, ts)
-        log_pxt = self.model(xts)
-        div = torch.zeros_like(x[:,0])
-        for i in range(u.shape[1]):
-            div += torch.autograd.grad(log_pxt[:,i], x, 
-                                       torch.ones_like(log_pxt[:,i]), 
-                                       retain_graph=True, 
-                                       create_graph=True)[0][:,i]
-        return div
+        return torch.logsumexp(self.log_pxt(x, ts), dim=0) 
 
     def dx_dt(self, x, ts):
         """
@@ -297,7 +281,6 @@ class CellDelta(nn.Module):
         dq_dx, dq_dt = self.pxt.dx_dt(x, ts)
         ux, div_ux = self.ux.div(x)
 
-        # TODO is (dq_dx*ux).sum(dim=2) correct? Maybe not the right way to sum the derivatives
         d_dx = ((dq_dx * ux).sum(dim=2) + div_ux)[...,None]
 
         # Enforce that dq_dt = -dx, i.e. that both sides of the fokker planck equation are equal
@@ -308,8 +291,44 @@ class CellDelta(nn.Module):
         
         return l_fp
     
+    def dq_dx_penalty(self, x, ts):
+        """
+        Compute the penalty for the gradient of the log probability with respect to x.
+        """
+        x.requires_grad = True
+        ts.requires_grad = True
+        
+        dq_dx, _ = self.pxt.dx_dt(x, ts)
+        # Compute the penalty for the gradient of the log probability with respect to x
+        penalty = (dq_dx**2).mean()
+        
+        x.requires_grad = False
+        ts.requires_grad = False
+        
+        return penalty
+    
+    def div_ux_penalty(self, x):
+        """
+        Penalize the divergence of the drift term.
+        """
+        x.requires_grad = True
+        ux, div_ux = self.ux.div(x)
+        x.requires_grad = False
+        penalty = (div_ux**2).mean()
+        
+        return penalty
+    
+    def ux0_penalty(self, x):
+        """
+        Penalize low values of the drift term at the initial conditions.
+        """
+        penalty = -torch.log((self.ux(x)**2).mean())
+        
+        return penalty
+    
     def optimize(self, X, X0, ts, px_noise, p0_noise, p0_alpha=1,
-                 pxt_lr=5e-4, ux_lr=1e-3, fokker_planck_alpha=1,  
+                 pxt_lr=5e-4, ux_lr=1e-3, fokker_planck_alpha=1, 
+                 div_alpha=1, dq_dx_alpha=1,
                  n_epochs=100, n_samples=1000, verbose=False):
         """
         Optimize the cell delta model parameters using the provided training data.
@@ -323,8 +342,7 @@ class CellDelta(nn.Module):
             p0_alpha (float, optional): The weight to apply to the initial conditions loss. Defaults to 1.
             pxt_lr (float, optional): The learning rate for the PXT model. Defaults to 5e-4.
             ux_lr (float, optional): The learning rate for the UX model. Defaults to 1e-3.
-            fokker_planck_alpha (bool, optional): The weight to apply to the Fokker-Planck loss term. Defaults to 1.
-            n_epochs (int, optional): The number of epochs to train for. Defaults to 100.
+            fokker_planck_alpha (bool, optional): The weight to apply to the Fokker-Planck loss term. Defaults to 1.            n_epochs (int, optional): The number of epochs to train for. Defaults to 100.
             n_samples (int, optional): The number of data samples to use in training for each epoch. Defaults to 1000.
             verbose (bool, optional): Whether to print the optimization progress. Defaults to False.
 
@@ -333,8 +351,8 @@ class CellDelta(nn.Module):
         """
         # nce_loss = self.nce_loss
 
-        self.pxt_optimizer = torch.optim.Adam(self.pxt.parameters(), lr=pxt_lr, weight_decay=1e-5)
-        self.ux_optimizer = torch.optim.Adam(self.ux.parameters(), lr=ux_lr, weight_decay=1e-5)
+        self.pxt_optimizer = torch.optim.Adam(self.pxt.parameters(), lr=pxt_lr)
+        self.ux_optimizer = torch.optim.Adam(self.ux.parameters(), lr=ux_lr)
 
         # Convenience variable for the time t=0
         zero = torch.zeros(1).to(self.device)
@@ -367,7 +385,21 @@ class CellDelta(nn.Module):
             # Calculate the Fokker-Planck loss
             l_fp = self.fokker_planck_loss(x, ts)*fokker_planck_alpha
             l_fp.backward()
-            
+
+            # Penalize the Fokker-Planck term at the initial conditions
+            l_fp0 = self.fokker_planck_loss(x, ts[:1])*fokker_planck_alpha
+            l_fp0.backward()
+
+            # l_dq_dx = self.dq_dx_penalty(x, ts)*dq_dx_alpha
+            # l_dq_dx.backward()
+
+            # l_dq_dx0 = self.dq_dx_penalty(x0, zero)*dq_dx_alpha
+            # l_dq_dx0.backward()
+
+            # # Penalize the divergence of the drift term
+            # l_div_ux = self.div_ux_penalty(x0)*div_alpha
+            # l_div_ux.backward()
+
             self.pxt_optimizer.step()
             self.ux_optimizer.step()
 
@@ -380,12 +412,15 @@ class CellDelta(nn.Module):
                 print(f'{epoch} l_nce_px={float(l_nce_px):.5f}, acc_px={float(acc_px):.5f}, '
                     f'l_nce_p0={float(l_nce_p0):.5f}, acc_p0={float(acc_p0):.5f}, '
                     f'l_fp={float(l_fp):.5f}, '
-                    # f'l_ux_weights={float(l_ux):.5f}, l_pxt_weights={float(l_pxt_weights):.5f}'
+                    f'l_fp0={float(l_fp0):.5f}, '
+                    # f'l_dq_dqx={float(l_dq_dx):.5f}, '
+                    # f'l_dq_dqx0={float(l_dq_dx0):.5f}, '
+                    # f'l_div_ux={float(l_div_ux):.5f} '
                     )
                 
         return {'l_nce_px': l_nce_pxs, 'l_nce_p0': l_nce_p0s, 'l_fp': l_fps}
     
-    def optimize_fokker_planck(self, X, ts, ux=True, px=True,
+    def optimize_fokker_planck(self, X, X0, ts, ux=True, px=True,
                                pxt_lr=5e-4, ux_lr=1e-3, fokker_planck_alpha=1,
                                noise=None,
                                n_epochs=100, n_samples=1000, verbose=False):
@@ -396,6 +431,7 @@ class CellDelta(nn.Module):
         self.ux_optimizer = torch.optim.Adam(self.ux.parameters(), lr=ux_lr)
 
         l_fps = np.zeros(n_epochs)
+        l_fp0s = np.zeros(n_epochs)
         
         n_samples = min(n_samples, len(X))
 
@@ -419,6 +455,10 @@ class CellDelta(nn.Module):
             l_fp = self.fokker_planck_loss(x, ts)*fokker_planck_alpha
             l_fp.backward()
 
+            # Fokker-Planck loss at t=0
+            l_fp0 = self.fokker_planck_loss(x, ts[:1])*fokker_planck_alpha
+            l_fp0.backward()
+
             if ux:
                 self.ux_optimizer.step()
             if px:
@@ -426,11 +466,12 @@ class CellDelta(nn.Module):
 
             # Record the losses
             l_fps[epoch] = float(l_fp.mean())
+            l_fp0s[epoch] = float(l_fp0.mean())
             
             if verbose:
-                print(f'{epoch} l_fp={float(l_fp):.5f}')
+                print(f'{epoch} l_fp={float(l_fp):.5f}, l_fp0={float(l_fp0):.5f}')
                 
-        return {'l_fp': l_fps}
+        return {'l_fp': l_fps, 'l_fp0': l_fp0s}
     
     def optimize_initial_conditions(self, X0, ts, p0_noise, pxt_lr=1e-3,
                                     n_epochs=100, verbose=False):
@@ -439,8 +480,7 @@ class CellDelta(nn.Module):
         """
         nce_loss = self.nce_loss
 
-        self.pxt_optimizer = torch.optim.Adam(self.pxt.parameters(), lr=pxt_lr,
-                                              weight_decay=1e-6)
+        self.pxt_optimizer = torch.optim.Adam(self.pxt.parameters(), lr=pxt_lr)
 
         l_nce_p0s = np.zeros(n_epochs)
         
@@ -450,8 +490,8 @@ class CellDelta(nn.Module):
 
             self.pxt_optimizer.zero_grad()
             
-            # Fit every time to the initial conditions
-            l_nce_p0, acc_p0 = nce_loss(X0, p0_noise, ts=t, scale=1)#/ts.shape[0])
+            # Fit every time to the initial distribution
+            l_nce_p0, acc_p0 = nce_loss(X0, p0_noise, ts=t, scale=1/ts.shape[0])
             l_nce_p0.backward()
 
             self.pxt_optimizer.step()
@@ -463,6 +503,21 @@ class CellDelta(nn.Module):
                 print(f'{epoch} l_nce_p0={float(l_nce_p0):.5f}, acc_p0={float(acc_p0):.5f}')
                 
         return {'l_nce_p0': l_nce_p0s}
+    
+    def initialize_ux(self, X, n_epochs, ux_lr=1e-3):
+        """
+        Initialize the drift term of the model using the data.
+        """
+        # Fit the drift term
+        self.ux_optimizer = torch.optim.Adam(self.ux.parameters(), lr=ux_lr)
+        for epoch in range(n_epochs):
+            self.ux_optimizer.zero_grad()
+            u = self.ux(X)
+            l = (u**2).mean()
+            l.backward()
+            self.ux_optimizer.step()
+            print(f'{epoch} ux_init_l={float(l):.5f}')
+        return l
                                       
 
     def simulate(self, X0, tsim, ux_alpha=1, sigma=1, zero_boundary=True):
