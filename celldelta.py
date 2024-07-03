@@ -455,22 +455,6 @@ class CellDelta(nn.Module):
                 print(f'{epoch} l_nce_p0={float(l_nce_p0):.5f}, acc_p0={float(acc_p0):.5f}')
                 
         return {'l_nce_p0': l_nce_p0s}
-    
-    def initialize_ux(self, X, n_epochs, ux_lr=1e-3):
-        """
-        Initialize the drift term of the model using the data.
-        """
-        # Fit the drift term
-        self.ux_optimizer = torch.optim.Adam(self.ux.parameters(), lr=ux_lr)
-        for epoch in range(n_epochs):
-            self.ux_optimizer.zero_grad()
-            u = self.ux(X)
-            l = (u**2).mean()
-            l.backward()
-            self.ux_optimizer.step()
-            print(f'{epoch} ux_init_l={float(l):.5f}')
-        return l
-                                      
 
     def simulate(self, X0, tsim, sigma=1, zero_boundary=True):
         """
