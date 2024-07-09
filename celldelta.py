@@ -5,7 +5,7 @@ import numpy as np
 
 # Define models 
 class MLP(torch.nn.Module):
-    def __init__(self, input_dim, output_dim, hidden_dim, num_layers, input_bias=True):
+    def __init__(self, input_dim, output_dim, hidden_dim, num_layers, input_bias=True, tscale=1):
         """
         Generic Dense Multi-Layer Perceptron (MLP), which is just a stack of linear layers with ReLU activations
         
@@ -24,18 +24,34 @@ class MLP(torch.nn.Module):
         layers.append(Linear(input_dim, hidden_dim, bias=input_bias))
         layers.append(ReLU())
         for i in range(num_layers - 1):
-            layers.append(Linear(hidden_dim, hidden_dim, bias=False))
+            layers.append(Linear(hidden_dim, hidden_dim, bias=True))
             layers.append(ReLU())
             # TODO do we need batch norm here?
-        layers.append(Linear(hidden_dim, output_dim, bias=False))
+        layers.append(Linear(hidden_dim, output_dim, bias=True))
         # Register the layers as a module of the model
         self.layers = torch.nn.ModuleList(layers)
+        self.tscale = torch.ones(input_dim)
+        self.tscale[-1] = tscale
+        # Register the time scaling factor as a parameter of the model
+        self.tscale = torch.nn.Parameter(self.tscale, requires_grad=False)
+
+    def set_tscale(self, tscale):
+        """
+        Set the time scaling factor for the model
+        """
+        self.tscale[-1] = tscale
 
     def forward(self, x):
-        for layer in self.layers:
+        # Scale the weights linear layer connected to the last element of the input by the time scale
+        layer0 = self.layers[0]
+        w = layer0.weight
+        b = layer0.bias
+        x = (x*self.tscale) @ w.T + b  # Perform the original operation
+        
+        for layer in self.layers[1:]:  # Corrected to start from the second layer
             x = layer(x)
         return x
-        
+            
 class Ux(torch.nn.Module):
     """
     The u(x) drift term of the Fokker-Planck equation, modeled by a neural network
@@ -53,12 +69,6 @@ class Ux(torch.nn.Module):
         super(Ux, self).__init__()
         # The drift term of the Fokker-Planck equation, modeled by a neural network
         self.model = MLP(input_dim, input_dim, hidden_dim, n_layers)
-        # Initialize the weights and biases of the model to have small magnitude
-        # for layer in self.model.layers:
-        #     if isinstance(layer, Linear):
-        #         torch.nn.init.normal_(layer.weight, mean=0.0, std=1e-5)
-        #         if layer.bias is not None:
-        #             torch.nn.init.constant_(layer.bias, 1e-6)
 
     def forward(self, x):
         # NOTE this works better in high dimensions when it's negative???
@@ -115,7 +125,6 @@ class Pxt(torch.nn.Module):
             ts (torch.tensor): The time points at which to evaluate the model of shape (n_timesteps,).
         
         Returns:
-            #TODO make sure the shape is correct
             torch.tensor: The log probability of the data at each time and data point of shape (n_cells, n_timesteps).
         """
 
@@ -150,12 +159,12 @@ class Pxt(torch.nn.Module):
         log_pxt = self.model(xts)
         dpdx = torch.autograd.grad(outputs=log_pxt, 
                                    inputs=xts, 
-                                   grad_outputs=torch.ones_like(log_pxt), # TODO is this correct?
+                                   grad_outputs=torch.ones_like(log_pxt), 
                                    create_graph=True,
                                    retain_graph=True)[0]
         # The last element of the gradient is the derivative with respect to t
         # The :-1 is to get the gradient with respect to x
-        # The -1: is to get the gradient with respect to t       
+        # The -1: is to get the gradient with respect to t
         return dpdx[...,:-1], dpdx[...,-1:]
     
     def sample(self, x0, n_steps, step_size, eps=None):
@@ -253,6 +262,40 @@ class CellDelta(nn.Module):
         
         return -v, acc
 
+    def pseudotime_loss(self, X, X0_mask, ts):
+        """
+        Penalize data points in the initial state that are not at the beginning of the pseudotime trajectory.
+        Also penalize data points that are not in the initial state that have a pseudotime of 0.
+
+        Args:
+            X0 (torch.Tensor): The initial state of the cells of shape (n_cells, n_genes).
+            ts (torch.Tensor): The time points at which to evaluate the model of shape (n_timesteps,).
+        """
+
+        log_pxt = self.pxt.log_pxt(X, ts)
+        log_pxtn0 = log_pxt[:, ~X0_mask]
+        log_pxt0 = log_pxt[:, X0_mask]
+        # Calculate the pseudotime of the initial state
+        # Pseudotime is the timestep of max probability
+        pt0 = torch.argmax(log_pxt0, dim=0).flatten()
+        pt = torch.argmax(log_pxtn0, dim=0).flatten()
+
+        # Penalize data points in the initial state that don't have a pseudotime of 0
+        if (pt0 != 0).any():
+            l_pt0 = log_pxt0[pt0[pt0!=0],pt0!=0].mean()
+            l_pt0 -= log_pxt0[torch.zeros_like(pt0[pt0!=0]),pt0!=0].mean()
+        else:
+            l_pt0 = torch.zeros(1, requires_grad=True).to(self.device)
+        # Penalize data points that are not in the initial state that have a pseudotime of 0
+        # if (pt == 0).any():
+        #     l_pt = log_pxtn0[pt[pt==0],pt==0].mean() #*((pt==0).sum()/pt.shape[0])
+        #     # l_pt -= log_pxtn0[torch.zeros_like(pt[pt==0]),pt==0].mean() #*((pt==0).sum()/pt.shape[0])
+        # else:
+        l_pt = torch.zeros(1, requires_grad=True).to(self.device)
+        
+        return l_pt0, l_pt
+        
+
     def fokker_planck_loss(self, x, ts):
         """
         This is the calculation of the term that ensures the derivatives match the log scale Fokker-Planck equation
@@ -270,11 +313,6 @@ class CellDelta(nn.Module):
         Returns:
             torch.Tensor: The tensor representing loss enforcing constraint to the Fokker-Planck term.
         """
-        # TODO usually this is set at initialization
-        # might be reinitalized to zeros.
-        # TODO validate with a polynomial function, 
-        # TODO make sure this has the correct gradient
-        # TODO maybe we need to scale the gradients by the number of points?
         x.requires_grad = True
         ts.requires_grad = True
         
@@ -291,9 +329,18 @@ class CellDelta(nn.Module):
         
         return l_fp
     
-    def optimize(self, X, X0, ts, px_noise, p0_noise, p0_alpha=1,
+    def max_consistency_loss(self, X, ts):
+        """
+        Ensure that each timepoint has a similar max probability
+        """
+        log_pxt = self.pxt.log_pxt(X, ts)
+        max_log_pxt = log_pxt.max(dim=1)[0]
+        l_max = (max_log_pxt - max_log_pxt.mean())**2
+        return l_max.mean()
+
+    def optimize(self, X, X0_mask, ts, px_noise, p0_noise, pt_alpha=1,
                  pxt_lr=5e-4, ux_lr=1e-3, fokker_planck_alpha=1, 
-                 div_alpha=1, dq_dx_alpha=1,
+                 l_max_alpha=None, 
                  n_epochs=100, n_samples=1000, verbose=False):
         """
         Optimize the cell delta model parameters using the provided training data.
@@ -314,8 +361,6 @@ class CellDelta(nn.Module):
         Returns:
             dict: A dictionary containing the loss values for each epoch.
         """
-        # nce_loss = self.nce_loss
-
         self.pxt_optimizer = torch.optim.Adam(self.pxt.parameters(), lr=pxt_lr)
         self.ux_optimizer = torch.optim.Adam(self.ux.parameters(), lr=ux_lr)
 
@@ -331,8 +376,9 @@ class CellDelta(nn.Module):
         for epoch in range(n_epochs):
             # Sample from the data distribution
             rand_idxs = torch.randperm(len(X))[:n_samples]
+            # TODO do I need to clone here?
             x = X[rand_idxs].clone().detach()
-            x0 = X0
+            x0_mask = X0_mask[rand_idxs]
 
             self.pxt_optimizer.zero_grad()
             self.ux_optimizer.zero_grad()
@@ -343,43 +389,63 @@ class CellDelta(nn.Module):
             l_nce_px.backward()
             
             # Calculate the Noise-Constrastive Loss of the initial distribution
-            l_nce_p0, acc_p0 = self.nce_loss(x0, p0_noise, ts=zero, scale=1)
-            l_nce_p0 = l_nce_p0 * p0_alpha
-            l_nce_p0.backward()
+            if pt_alpha is not None:
+                # l_nce_p0, acc_p0 = self.nce_loss(x0, p0_noise, ts=zero, scale=1)
+                # l_nce_p0 = l_nce_p0 * p0_alpha
+                # l_nce_p0.backward()
+                l_pt0, l_pt = self.pseudotime_loss(x, x0_mask, ts)
+                l_pt0 = l_pt0*pt_alpha
+                l_pt = l_pt*pt_alpha
+                l_pt0.backward(retain_graph=True)
+                l_pt.backward()
+            else:
+                l_pt0 = zero
+                l_pt = zero
                        
-            # Calculate the Fokker-Planck loss
-            l_fp = self.fokker_planck_loss(x, ts)*fokker_planck_alpha
-            l_fp.backward()
+            if fokker_planck_alpha is not None:
+                # Calculate the Fokker-Planck loss
+                l_fp = self.fokker_planck_loss(x, ts)*fokker_planck_alpha
+                l_fp.backward()
 
-            # Penalize the Fokker-Planck term at the initial conditions
-            l_fp0 = self.fokker_planck_loss(x, ts[:1])*fokker_planck_alpha
-            l_fp0.backward()
+                # Penalize the Fokker-Planck term at the initial conditions
+                # l_fp0 = self.fokker_planck_loss(x[x0_mask], ts) #+ self.fokker_planck_loss(x, ts[:1])*fokker_planck_alpha
+                # l_fp0.backward()
+                l_fp0 = zero
+            else:
+                l_fp = zero
+                l_fp0 = zero
+
+            if l_max_alpha is not None:
+                l_max = self.max_consistency_loss(x, ts)
+                l_max.backward()
+            else:
+                l_max = zero
 
             self.pxt_optimizer.step()
             self.ux_optimizer.step()
 
             # Record the losses
             l_nce_pxs[epoch] = float(l_nce_px.mean())
-            l_nce_p0s[epoch] = float(l_nce_p0.mean())
             l_fps[epoch] = float(l_fp.mean())
             
             if verbose:
-                print(f'{epoch} l_nce_px={float(l_nce_px):.5f}, acc_px={float(acc_px):.5f}, '
-                    f'l_nce_p0={float(l_nce_p0):.5f}, acc_p0={float(acc_p0):.5f}, '
+                print(f'{epoch:6d} l_nce_px={float(l_nce_px):.5f}, acc_px={float(acc_px):.5f}, '
+                    f'l_pt0={float(l_pt0): .5f}, '
+                    f'l_pt={float(l_pt): .5f}, '
                     f'l_fp={float(l_fp):.5f}, '
                     f'l_fp0={float(l_fp0):.5f}, '
+                    f'l_max={float(l_max):.5f}'
                     )
                 
         return {'l_nce_px': l_nce_pxs, 'l_nce_p0': l_nce_p0s, 'l_fp': l_fps}
     
-    def optimize_fokker_planck(self, X, X0, ts, ux=True, px=True,
-                               pxt_lr=5e-4, ux_lr=1e-3, fokker_planck_alpha=1,
+    def optimize_fokker_planck(self, X, ts, 
+                               ux_lr=1e-3, fokker_planck_alpha=1,
                                noise=None,
                                n_epochs=100, n_samples=1000, verbose=False):
         """
         Optimize the Fokker-Planck component of the loss independently of the NCE component.
         """
-        self.pxt_optimizer = torch.optim.Adam(self.pxt.parameters(), lr=pxt_lr)
         self.ux_optimizer = torch.optim.Adam(self.ux.parameters(), lr=ux_lr)
 
         l_fps = np.zeros(n_epochs)
@@ -408,13 +474,11 @@ class CellDelta(nn.Module):
             l_fp.backward()
 
             # Fokker-Planck loss at t=0
-            l_fp0 = self.fokker_planck_loss(x, ts[:1])*fokker_planck_alpha
-            l_fp0.backward()
+            # l_fp0 = self.fokker_planck_loss(x, ts[:1])*fokker_planck_alpha
+            # l_fp0.backward()
+            l_fp0 = torch.zeros(1).to(self.device)
 
-            if ux:
-                self.ux_optimizer.step()
-            if px:
-                self.pxt_optimizer.step()
+            self.ux_optimizer.step()
 
             # Record the losses
             l_fps[epoch] = float(l_fp.mean())
@@ -426,7 +490,7 @@ class CellDelta(nn.Module):
         return {'l_fp': l_fps, 'l_fp0': l_fp0s}
     
     def optimize_initial_conditions(self, X0, ts, p0_noise, pxt_lr=1e-3,
-                                    n_epochs=100, verbose=False):
+                                    n_epochs=100, verbose=False, scale=1):
         """
         Optimize the initial conditions of the model.
         """
@@ -443,7 +507,7 @@ class CellDelta(nn.Module):
             self.pxt_optimizer.zero_grad()
             
             # Fit every time to the initial distribution
-            l_nce_p0, acc_p0 = nce_loss(X0, p0_noise, ts=t, scale=1/ts.shape[0])
+            l_nce_p0, acc_p0 = nce_loss(X0, p0_noise, ts=t, scale=scale)
             l_nce_p0.backward()
 
             self.pxt_optimizer.step()

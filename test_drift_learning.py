@@ -51,7 +51,10 @@ N = 1000
 tsteps = 100
 X = torch.randn((N, tsteps), device=device)
 X_t = X + torch.arange(0, tsteps, device=device)
-X0 = X_t[:,0, None]
+X0 = X_t[:,0, None] 
+X0_mask = torch.zeros_like(X_t, dtype=bool)
+X0_mask[:,0] = True
+X0_mask = X0_mask.flatten()
 X = X_t.flatten()[:,None]
 #%%
 # Plot the sequence of distributions
@@ -86,44 +89,31 @@ noise0 = D.MultivariateNormal(mean0, cov0)
 #%%
 # Train the model
 losses = celldelta.optimize_initial_conditions(X0, ts, p0_noise=noise0, 
-                                               n_epochs=1500, 
+                                               n_epochs=1500,
+                                               scale=ts.shape[0], 
                                                verbose=True)
 #%%
-p0_alpha = 0
+pt_alpha = None
 fokker_planck_alpha = 1
-losses = celldelta.optimize(X, X0, ts,
+losses = celldelta.optimize(X, X0_mask, ts,
                             pxt_lr=1e-4, ux_lr=1e-4, 
                             n_epochs=2500, n_samples=n_samples, 
                             px_noise=noise, p0_noise=noise0, 
                             fokker_planck_alpha=fokker_planck_alpha,
-                            p0_alpha=p0_alpha, 
+                            pt_alpha=pt_alpha, 
                             verbose=True)
+
 #%%
 # Optimize the Fokker-Planck term
 fokker_planck_alpha = 1000
-_ = celldelta.optimize_fokker_planck(X, X0, ts,
-                                     pxt_lr=0, ux_lr=1e-4,
+_ = celldelta.optimize_fokker_planck(X, ts,
+                                     ux_lr=1e-4,
                                      fokker_planck_alpha=fokker_planck_alpha,
-                                     px=False, ux=True,
                                      noise=None,
                                      n_epochs=1000, 
                                      n_samples=n_samples,
                                      verbose=True)
 
-#%%
-l_fps = losses['l_fp']
-l_pxs = losses['l_nce_px']
-l_p0s = losses['l_nce_p0']
-
-fig, axs = plt.subplots(3, 1, figsize=(10,10))
-axs[0].plot(l_fps[10:], label='l_fp')
-axs[1].plot(l_pxs[10:], label='l_pxs')
-axs[2].plot(l_p0s[10:], label='l_p0')
-[axs[i].set_xlabel('Epoch') for i in range(len(axs))]
-[axs[i].set_ylabel('Loss') for i in range(len(axs))]
-[axs[i].legend() for i in range(len(axs))]
-fig.suptitle('Loss curves')
-fig.tight_layout()
 
 # %%
 # Calculate the u(x) and p(x,t) for each cell 
@@ -156,8 +146,9 @@ plt.ylabel('p(x,t)')
 # Add a colorbar to show the timestep
 sm = plt.cm.ScalarMappable(cmap=viridis, norm=plt.Normalize(vmin=0, vmax=1))
 sm.set_array([])
-plt.colorbar(sm, label='timestep (t)')
-plt.legend()
+plt.colorbar(sm, label='timestep (t)', ax=plt.gca())
+plt.legend();
+
 # %%
 # Plot the u(x) term for all x
 xs = torch.arange(l, h, .01, device=device)[:,None]
@@ -165,7 +156,7 @@ uxs = celldelta.ux(xs).squeeze().cpu().detach().numpy()
 xs = xs.squeeze().cpu().detach().numpy()
 fig, ax1 = plt.subplots(1,1, figsize=(10,5))
 plt.title('u(x) vs p(x)')
-ax1.plot(xs, uxs, c='blue', alpha=.6)
+ax1.plot(xs[1000:], uxs[1000:], c='blue', alpha=.6)
 # ax1.plot(xs, uxs, label='u(x)')
 # Add vertical and horizontal grid lines
 ax1.grid()
@@ -189,18 +180,6 @@ plt.plot(pxts.sum(axis=0), marker='o', markersize=2, c='orange', label='sum p(x,
 plt.ylabel('sum p(x,t)', c='orange')
 print(f'Min sum pxt {pxts.sum(axis=0).min():.2e} t={pxts.sum(0).argmin()}')
 print(f'Max sum pxt {pxts.sum(axis=0).min():.2e} t={pxts.sum(0).argmin()}')
-#%%
-# Plot the Fokker Planck terms
-# X.requires_grad = True
-# dq_dx, dq_dt = celldelta.pxt.dx_dt(X, ts)
-# ux, du_dx = celldelta.ux.dx(X)
-# d_dx = ((dq_dx * ux).sum(dim=2) + du_dx)[...,None]
-# for i in range(0,len(ts),len(ts)//10):
-#     plt.plot(X, dq_dt[i,:], c='r')
-#     plt.plot(X, dq_dx[i,:], c='blue')
-# labels = ['d/dt p(x,t)', 'd/dx u(x) p(x,t)']
-# plt.legend(labels)
-# X.requires_grad = False
 
 # %%
 # This plots the cumulative mean of p(x,t) at each timestep t, going from t=0 (left) to t=1 (right)
@@ -232,7 +211,7 @@ axs[1].set_xlabel('timestep (t)')
 x = X0.clone().detach()
 zero_boundary = True
 ts.requires_grad = False
-xts = celldelta.simulate(x, ts, zero_boundary=zero_boundary, sigma=0, ux_alpha=1)
+xts = celldelta.simulate(x, ts, zero_boundary=zero_boundary, sigma=0)
 
 #%%
 # Plot the resulting probability densities at each timestep
@@ -297,6 +276,8 @@ dq_dx = tonp(dq_dx)
 du_dx = tonp(du_dx)
 dq_dt = tonp(dq_dt)
 d_dx = tonp(d_dx)
+div_x = celldelta.ux.div(xs)[1]
+div_x = tonp(div_x)
 xs = tonp(xs)
 uxs = tonp(uxs)
 fp_err = tonp(fp_err)
@@ -306,31 +287,36 @@ reds = matplotlib.cm.get_cmap('Reds')
 tsi = np.linspace(0, len(ts)-1, 5, dtype=int)
 fig, axs = plt.subplots(len(tsi), 1, figsize=(6,5*len(tsi)))
 
+span = slice(2974,(2974*2))
+
 for i in range(5):
-    # axs[i].plot(xs[2974:], (d_dx[tsi[i]])[2974:], 
+    # axs[i].plot(xs[span], (d_dx[tsi[i]])[span], 
     #             label='d_dx', 
     #             alpha=1, c='red', linewidth=.5)
-    # axs[i].plot(xs[2974:], (dq_dt[tsi[i]])[2974:], 
+    # axs[i].plot(xs[span], (dq_dt[tsi[i]])[span], 
     #             label='dq_dt', 
     #             alpha=1, c='blue', linewidth=.5)
-    # axs[i].plot(xs[2974:], (dq_dx[tsi[i]])[2974:],
+    # axs[i].plot(xs[span], (dq_dx[tsi[i]])[span],
     #             label='dq_dx', alpha=1, c='green', linewidth=.5)
-    # axs[i].plot(xs[2974:], (uxs[2974:]),
+    # axs[i].plot(xs[span], (uxs[span]),
     #             label='ux', alpha=1, c='orange', linewidth=.5)
-    # axs[i].plot(xs[2974:], (dq_dx*uxs)[tsi[i]][2974:],
-    #             label='dq_dx * u(x)', 
-    #             alpha=1, c='black', linewidth=.5)
-    axs[i].plot(xs[2974:], (d_dx[tsi[i]] + dq_dt[tsi[i]])[2974:],
+    axs[i].plot(xs[span], (dq_dx*uxs)[tsi[i]][span],
+                label='dq_dx * u(x)', 
+                alpha=1, c='black', linewidth=.5)
+    axs[i].plot(xs[span], (d_dx[tsi[i]] + dq_dt[tsi[i]])[span],
                 label='Fokker-Planck error', 
                 alpha=1, c='magenta', linewidth=.5)
     # Summed FP error
-    axs[i].plot(xs[2974:], (((d_dx + dq_dt)**2).mean(0))[2974:],
-                label='Fokker-Planck error', 
-                alpha=1, c='purple', linewidth=.5)
+    # axs[i].plot(xs[span], (((d_dx + dq_dt)**2).mean(0))[span],
+    #             label='Fokker-Planck error', 
+    #             alpha=1, c='purple', linewidth=.5)
     # Cumulative FP error
-    # axs[i].plot(xs[2974:], np.cumsum(np.abs((fp_err[tsi[i]])[2974:]))/np.sum(np.abs(fp_err[tsi[i]][2974:5000])),
+    # axs[i].plot(xs[span], np.cumsum(np.abs((fp_err[tsi[i]])[span]))/np.sum(np.abs(fp_err[tsi[i]][span])),
     #             label='Cumulative Fokker-Planck error', 
     #             alpha=1, c='brown', linewidth=.5)
+    axs[i].plot(xs[span], div_x[span],
+                label='div u(x)', 
+                alpha=1, c='blue', linewidth=.5)
     axs[i].axhline(0, c='grey', alpha=.6, linewidth=.4)
     axs[i].axvline(0, c='grey', alpha=.6, linewidth=.4)
 # Put the legend on each plot
@@ -378,6 +364,20 @@ axs[3].plot(pt.reshape(N, -1).mean(axis=0), c='green')
 axs[3].set_title('Mean pseudotime of each set of points')
 
 #%%
+l_fps = losses['l_fp']
+l_pxs = losses['l_nce_px']
+l_p0s = losses['l_nce_p0']
+
+fig, axs = plt.subplots(3, 1, figsize=(10,10))
+axs[0].plot(l_fps[10:], label='l_fp')
+axs[1].plot(l_pxs[10:], label='l_pxs')
+axs[2].plot(l_p0s[10:], label='l_p0')
+[axs[i].set_xlabel('Epoch') for i in range(len(axs))]
+[axs[i].set_ylabel('Loss') for i in range(len(axs))]
+[axs[i].legend() for i in range(len(axs))]
+fig.suptitle('Loss curves')
+fig.tight_layout()
+#%%
 # Higher Dimensional Gaussians
 #####################################################
 # Sequence of distributions
@@ -385,7 +385,9 @@ axs[3].set_title('Mean pseudotime of each set of points')
 N = 99
 tsteps = 100
 d = 5
-ts = torch.linspace(0, 1, tsteps, device=device)*100
+tscale = 10
+ts = torch.linspace(0, 1, tsteps, device=device)*tscale
+ts_np = ts.cpu().detach().numpy()
 X = torch.randn((N, d, tsteps), device=device)
 # Create a sequence of steps to add to each timestep
 v = torch.arange(0, tsteps, device=device)
@@ -394,10 +396,14 @@ v = v.repeat((1, d, 1))
 # Zero out the first dimension
 v[:,0] = 0
 X_t = X + v
-# TODO change back to 0
-X0 = X_t[:, :, 0] 
+# Change X_t to shape (N, tsteps, d)
 X_t = X_t.permute(0, 2, 1)
+# Flatten X_t to shape (N*tsteps, d)
 X = X_t.reshape((N*tsteps, d))
+X0 = X_t[:, 0, :] 
+X0_mask = torch.zeros((N,tsteps), dtype=bool)
+X0_mask[:,0] = True
+X0_mask = X0_mask.flatten()
 # Compute PCA of the data
 from sklearn.decomposition import PCA
 pca = PCA(n_components=2)
@@ -422,50 +428,54 @@ noise0 = D.MultivariateNormal(mean0, cov0)
 #%%
 # Train the model
 losses = celldelta.optimize_initial_conditions(X0, ts, p0_noise=noise0, 
+                                               scale=1/ts.shape[0],
                                                pxt_lr=1e-3,
-                                               n_epochs=1000, 
+                                               n_epochs=500, 
                                                verbose=True)
 #%%
-p0_alpha = 0.0
-fokker_planck_alpha = 0
-div_alpha = 0
-dq_dx_alpha = 0
-losses = celldelta.optimize(X, X0, ts,
-                            pxt_lr=1e-4, ux_lr=0, 
-                            n_epochs=2000, n_samples=n_samples, 
-                            px_noise=noise, p0_noise=noise0, 
+start = time.time()
+n_samples = 1000
+pt_alpha = None
+fokker_planck_alpha = 1
+l_max_alpha = None
+ux_lr  = 1e-4
+pxt_lr = 1e-4
+
+celldelta.pxt.model.set_tscale(500)
+
+losses = celldelta.optimize(X, X0_mask, ts,
+                            pxt_lr=pxt_lr, 
+                            ux_lr=ux_lr,
+                            n_epochs=5000, n_samples=n_samples, 
+                            px_noise=noise, p0_noise=None, 
                             fokker_planck_alpha=fokker_planck_alpha,
-                            p0_alpha=p0_alpha, 
-                            div_alpha=div_alpha,
-                            dq_dx_alpha=dq_dx_alpha,
+                            pt_alpha=pt_alpha, 
+                            l_max_alpha=l_max_alpha,
                             verbose=True)
+
+end = time.time()
+print(f'Time elapsed: {end-start:.2f}s')
 
 #%%
-p0_alpha = 0.0
 fokker_planck_alpha = 1
-div_alpha = 0
-dq_dx_alpha = 0
-losses = celldelta.optimize(X, X0, ts,
-                            pxt_lr=1e-4, ux_lr=1e-4, 
-                            n_epochs=2000, n_samples=n_samples, 
-                            px_noise=noise, p0_noise=noise0, 
-                            fokker_planck_alpha=fokker_planck_alpha,
-                            p0_alpha=p0_alpha,
-                            div_alpha=div_alpha,
-                            dq_dx_alpha=dq_dx_alpha, 
-                            verbose=True)
 
+_=celldelta.optimize_fokker_planck(X, ts,
+                                   ux_lr=1e-3,
+                                   fokker_planck_alpha=fokker_planck_alpha,
+                                   noise=None,
+                                   n_epochs=1000, 
+                                   n_samples=n_samples,
+                                   verbose=True)
 #%%
 fokker_planck_alpha = 1000
-
-losses = celldelta.optimize_fokker_planck(X, X0, ts,
-                                          pxt_lr=0, ux_lr=1e-4,
-                                          fokker_planck_alpha=fokker_planck_alpha,
-                                          px=False, ux=True,
-                                          noise=5,
-                                          n_epochs=1000, 
-                                          n_samples=n_samples,
-                                          verbose=True)
+for fp_noise_scale in np.linspace(0.01, 10, 10):
+    losses = celldelta.optimize_fokker_planck(X, ts,
+                                              ux_lr=1e-4,
+                                              fokker_planck_alpha=fokker_planck_alpha,
+                                              noise=fp_noise_scale,
+                                              n_epochs=1000, 
+                                              n_samples=n_samples,
+                                              verbose=True)
 # plt.plot(losses['l_fp'], label='l_fp')
 # plt.plot(losses['l_fp0'], label='l_fp0')
 
@@ -529,14 +539,14 @@ plt.tight_layout()
 # Mark the initial points with a black triangle
 # x0_proj = pca.transform(X0.cpu().numpy())
 # plt.scatter(x0_proj[:,0], x0_proj[:,1], color='black', alpha=.5, s=9.5, marker='^')
-#%%
+#
 # Plot the p(x,t) for a new timestep at -1
-Xn1 = torch.randn((N, d), device=device)-1
-pxtn1 = celldelta.pxt(Xn1, ts).squeeze().T.cpu().detach().numpy()
-x_proj_n1 = pca.transform(Xn1.cpu().numpy())
-plt.scatter(x_proj[:,0], x_proj[:,1], c=pxts[:,0], cmap=viridis, s=1)
-plt.scatter(x_proj_n1[:,0], x_proj_n1[:,1], c=pxtn1[:,0], cmap=viridis, s=10, marker='x')
-plt.colorbar()
+# Xn1 = torch.randn((N, d), device=device)-1
+# pxtn1 = celldelta.pxt(Xn1, ts).squeeze().T.cpu().detach().numpy()
+# x_proj_n1 = pca.transform(Xn1.cpu().numpy())
+# plt.scatter(x_proj[:,0], x_proj[:,1], c=pxts[:,0], cmap=viridis, s=1)
+# plt.scatter(x_proj_n1[:,0], x_proj_n1[:,1], c=pxtn1[:,0], cmap=viridis, s=10, marker='x')
+# plt.colorbar()
 
 #%%
 plt.plot(pxts.mean(axis=0), marker='o', markersize=2, c='blue')
@@ -547,7 +557,8 @@ plt.ylabel('max p(x,t)', c='orange')
 #%%
 # Plot arrows pointing in the direction of the drift term u(x)
 # Select a random subset of cells
-n_cells = 103
+n_cells = 503
+
 random_idxs = torch.randperm(X.shape[0])[:n_cells]
 random_cells = X[random_idxs,:]
 # Get the drift term u(x) for each cell
@@ -559,22 +570,24 @@ random_drifts = random_cells + uxs
 # Project the random_cells and random_drifts onto the PCA components
 random_cells_proj = pca.transform(random_cells.detach().cpu().numpy())
 random_drifts_proj = pca.transform(random_drifts.detach().cpu().numpy())
-fig, axs = plt.subplots(1,2, figsize=(10,5))
+fig, axs = plt.subplots(1,2, figsize=(20,10))
 # Plot all the cells
 axs[0].scatter(x_proj[:,0], x_proj[:,1], c='grey', s=.5, alpha=.5)
 # Plot the random cells
 axs[0].scatter(random_cells_proj[:,0], random_cells_proj[:,1], c='black', s=1)
-# Plot the random drifts as arrows from the random cells
+# Scaling factor for the arrow length
+arrow_scale = .5
 
+# Plot the random drifts as arrows from the random cells
 for i in range(n_cells):
     axs[0].arrow(random_cells_proj[i,0], random_cells_proj[i,1],
-              (random_drifts_proj[i,0] - random_cells_proj[i,0])*5,
-              (random_drifts_proj[i,1] - random_cells_proj[i,1])*5,
-              color='red', alpha=.5, width=.002)
+                 (random_drifts_proj[i,0] - random_cells_proj[i,0])*arrow_scale,
+                 (random_drifts_proj[i,1] - random_cells_proj[i,1])*arrow_scale,
+                 color='red', alpha=.5, width=.002)
 
 noise_vectors = False
 if noise_vectors:
-    noise_sample_size = 1
+    noise_sample_size = 200
     ux_noise_scale = 10
     ux_noise = D.MultivariateNormal(torch.zeros(d, device=device), 
                                     torch.eye(d, device=device)*ux_noise_scale)
@@ -584,13 +597,12 @@ if noise_vectors:
     noise_ux = celldelta.ux(noise_sample)
     noise_sample_drifts = noise_sample + noise_ux
     noise_sample_drifts_proj = pca.transform(noise_sample_drifts.detach().cpu().numpy())
-    axs[0].scatter(noise_sample_proj[:,0], noise_sample_proj[:,1], c='blue', s=1)
     for i in range(noise_sample_size):
         axs[0].arrow(noise_sample_proj[i,0], noise_sample_proj[i,1],
-                (noise_sample_drifts_proj[i,0] - noise_sample_proj[i,0])*5,
-                (noise_sample_drifts_proj[i,1] - noise_sample_proj[i,1])*5,
+                (noise_sample_drifts_proj[i,0] - noise_sample_proj[i,0])*arrow_scale,
+                (noise_sample_drifts_proj[i,1] - noise_sample_proj[i,1])*arrow_scale,
                 color='blue', alpha=.5, width=.002)
-axs[1].scatter(x_proj[:,0], x_proj[:,1], c=tonp((ux**2).sum(1)), cmap='viridis',s=1)
+axs[1].scatter(x_proj[:,0], x_proj[:,1], c=tonp((ux**2).sum(1)), cmap='viridis',s=4)
 axs[1].set_title('magnitude ux')
 # Add a colorbar of the cmap from axs[1]
 plt.colorbar(axs[1].collections[0], ax=axs[1])
@@ -603,8 +615,9 @@ x = x0
 
 zero_boundary = False
 max_t = 1
-xts = celldelta.simulate(x, tsim=torch.linspace(0, max_t, 100, device=device)*100,
-                         zero_boundary=zero_boundary, sigma=0.1, ux_alpha=1.0)
+sigma=.1
+xts = celldelta.simulate(x, tsim=torch.linspace(0, max_t, 100, device=device)*tscale,
+                         zero_boundary=zero_boundary, sigma=sigma)
 
 #%%
 # Plot trajectory of a single cell
@@ -631,11 +644,11 @@ if scatter:
     xts_flat = xts.reshape(-1, xts.shape[-1])
     random_idxs = np.random.randint(0, xts_flat.shape[0], 50_000)
     xts_flat = xts_flat[random_idxs,:]
-    t_idxs = ts.repeat((xts.shape[1])).reshape(-1)[random_idxs]
+    t_idxs = tonp(ts.tile((xts.shape[:2])).T.flatten()[random_idxs])
     xts_proj = pca.transform(xts_flat)
     # plt.scatter(x_proj[:,0], x_proj[:,1], c=ts_np[pxts.argmax(axis=1)], cmap='b', alpha=.1, s=1)
     plt.scatter(x_proj[:,0], x_proj[:,1], c='black', alpha=1, s=1)
-    plt.scatter(xts_proj[:,0], xts_proj[:,1], s=.5, alpha=.1)
+    plt.scatter(xts_proj[:,0], xts_proj[:,1], s=.5, alpha=.5, c=t_idxs, cmap=viridis)
 #%%
 X.requires_grad = True
 dq_dx, dq_dt = celldelta.pxt.dx_dt(X, ts)
@@ -688,7 +701,7 @@ for i in range(5):
     fp_err = tonp(d_dx_ti+dq_dti)**2
 
     axs[i].set_title(f'Fokker-Planck error t={int(ts[ti].item())}')
-    axs[i].scatter(x_proj[:,0], x_proj[:,1], c=fp_err, cmap='viridis',s=3,alpha=.3)
+    axs[i].scatter(x_proj[:,0], x_proj[:,1], c=fp_err, cmap='viridis',s=1,alpha=1)
     plt.colorbar(axs[i].collections[0], ax=axs[i])
 plt.tight_layout()
 
@@ -729,4 +742,24 @@ plt.colorbar(axs[5][1].collections[0], ax=axs[5][1])
 
 plt.tight_layout()
 
+# %%
+# Compute the gradient of the drift term u(x) with respect to the fokker-planck term
+x.requires_grad = True
+ts.requires_grad = True
+dq_dx, dq_dt = celldelta.pxt.dx_dt(x, ts)
+ux, div_ux = celldelta.ux.div(x)
+ux.retain_grad()
+dq_dx.retain_grad()
+d_dx = ((dq_dx * ux).sum(dim=2) + div_ux)[...,None]
+
+# Enforce that dq_dt = -dx, i.e. that both sides of the fokker planck equation are equal
+l_fp = ((d_dx + dq_dt)**2).mean()
+x.requires_grad = False
+ts.requires_grad = False
+
+l_fp.backward()
+ux_grad = ux.grad
+dq_dx_grad = dq_dx.grad
+print(ux_grad.mean().item(), ux_grad.std().item())
+print(dq_dx_grad.mean().item(), dq_dx_grad.std().item())
 # %%
