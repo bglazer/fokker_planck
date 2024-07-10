@@ -10,7 +10,6 @@ import scanpy as sc
 import torch.distributions as D
 from celldelta import CellDelta
 import time
-#%%
 tonp = lambda x: x.detach().cpu().numpy()
 #%%
 # Create a celldelta model with a very simple u(x) model
@@ -93,14 +92,14 @@ losses = celldelta.optimize_initial_conditions(X0, ts, p0_noise=noise0,
                                                scale=ts.shape[0], 
                                                verbose=True)
 #%%
-pt_alpha = None
+p0_alpha = None
 fokker_planck_alpha = 1
 losses = celldelta.optimize(X, X0_mask, ts,
                             pxt_lr=1e-4, ux_lr=1e-4, 
                             n_epochs=2500, n_samples=n_samples, 
                             px_noise=noise, p0_noise=noise0, 
                             fokker_planck_alpha=fokker_planck_alpha,
-                            pt_alpha=pt_alpha, 
+                            p0_alpha=p0_alpha, 
                             verbose=True)
 
 #%%
@@ -385,7 +384,7 @@ fig.tight_layout()
 device = 'cuda:1'
 N = 99
 tsteps = 100
-d = 5
+d = 50
 tscale = 10
 ts = torch.linspace(0, 1, tsteps, device=device)*tscale
 ts_np = ts.cpu().detach().numpy()
@@ -413,7 +412,9 @@ x_proj = pca.fit_transform(X.cpu().numpy())
 # Initialize the model
 celldelta = CellDelta(input_dim=d, device=device,
                       ux_hidden_dim=64, ux_layers=2, 
-                      pxt_hidden_dim=64, pxt_layers=2)
+                      pxt_hidden_dim=64, pxt_layers=2,
+                      batch_norm=True
+                      )
 
 mean = X.mean(dim=0, keepdim=False)
 cov = np.cov(X.cpu().numpy().T)
@@ -428,62 +429,73 @@ noise0 = D.MultivariateNormal(mean0, cov0)
 
 #%%
 # Train the model
-losses = celldelta.optimize_initial_conditions(X0, ts, p0_noise=noise0, 
+losses = celldelta.optimize_initial_conditions(X0, ts, p0_noise=noise, 
                                                scale=1/ts.shape[0],
                                                pxt_lr=1e-3,
-                                               n_epochs=500, 
+                                               n_epochs=600, 
                                                verbose=True)
 #%%
 start = time.time()
 n_samples = 1000
+p0_alpha = 1
+fokker_planck_alpha = 1
+l_consistency_alpha = None
 pt_alpha = None
-fokker_planck_alpha = None
-l_max_alpha = None
-ux_lr  = 1e-4
-pxt_lr = 1e-4
+ux_lr  = 1e-3
+pxt_lr = 1e-2
 
-celldelta.pxt.model.set_tscale(100)
+celldelta.pxt.model.set_tscale(1)
 
-losses = celldelta.optimize(X, X0_mask, ts,
+losses = celldelta.optimize(X=X, 
+                            X0=X0, 
+                            X0_mask=X0_mask,
+                            ts=ts, 
                             pxt_lr=pxt_lr, 
                             ux_lr=ux_lr,
-                            n_epochs=2500, n_samples=n_samples, 
-                            px_noise=noise, p0_noise=None, 
+                            n_epochs=5000, 
+                            n_samples=n_samples, 
+                            p0_noise=noise0,
+                            px_noise=noise, 
                             fokker_planck_alpha=fokker_planck_alpha,
-                            pt_alpha=pt_alpha, 
-                            l_max_alpha=l_max_alpha,
+                            p0_alpha=p0_alpha, 
+                            pt_alpha=pt_alpha,
+                            l_consistency_alpha=l_consistency_alpha,
                             verbose=True)
 
 end = time.time()
 print(f'Time elapsed: {end-start:.2f}s')
 #%%
-fokker_planck_alpha = 1
+fokker_planck_alpha = 10
 
 _=celldelta.optimize_fokker_planck(X, ts,
-                                   ux_lr=1e-3,
+                                   ux_lr=1e-4,
                                    fokker_planck_alpha=fokker_planck_alpha,
                                    noise=None,
-                                   n_epochs=1000, 
+                                   n_epochs=500, 
                                    n_samples=n_samples,
                                    verbose=True)
 
 #%%
 start = time.time()
 n_samples = 1000
-pt_alpha = None
+p0_alpha = 1
 fokker_planck_alpha = 1
-l_max_alpha = None
-ux_lr  = 1e-4
-pxt_lr = 1e-4
+l_consistency_alpha = None
+ux_lr  = 1e-3
+pxt_lr = 1e-3
 
-losses = celldelta.optimize(X, X0_mask, ts,
+losses = celldelta.optimize(X=X, 
+                            X0=X0, 
+                            ts=ts, 
                             pxt_lr=pxt_lr, 
                             ux_lr=ux_lr,
-                            n_epochs=5000, n_samples=n_samples, 
-                            px_noise=noise, p0_noise=None, 
+                            n_epochs=5000, 
+                            n_samples=n_samples, 
+                            p0_noise=noise0,
+                            px_noise=noise, 
                             fokker_planck_alpha=fokker_planck_alpha,
-                            pt_alpha=pt_alpha, 
-                            l_max_alpha=l_max_alpha,
+                            p0_alpha=p0_alpha, 
+                            l_consistency_alpha=l_consistency_alpha,
                             verbose=True)
 
 end = time.time()
@@ -535,7 +547,7 @@ axs[1].hist(diffs, bins=np.arange(diffs.min(),diffs.max()))
 axs[1].set_title('Count of differences of estimated versus true pseudotime')
 # Set the ticks of the x-axis to be in the middle of the bins
 axs[1].set_xticks(np.arange(diffs.min(),diffs.max())+0.5, 
-                  labels=np.arange(diffs.min(),diffs.max()))
+                  labels=np.arange(diffs.min(),diffs.max()), rotation=90)
 
 # Make a empirical cumulative distribution of the differences
 abs_diffs = np.sort(np.abs(diffs))
@@ -634,7 +646,9 @@ axs[1].scatter(x_proj[:,0], x_proj[:,1], c=tonp((ux**2).sum(1)), cmap='viridis',
 axs[1].set_title('magnitude ux')
 # Add a colorbar of the cmap from axs[1]
 plt.colorbar(axs[1].collections[0], ax=axs[1])
-print('UX mean magnitude:', (ux**2).mean(0))# %%
+print('UX mean magnitude:')
+for i in range(ux.shape[1]):
+    print(f'{(ux**2).mean(0)[i].item():.4f}')# %%
 #%%
 # Simulate the stochastic differential equation using the Euler-Maruyama method
 # with the learned drift term u(x)
