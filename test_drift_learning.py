@@ -382,6 +382,7 @@ fig.tight_layout()
 #####################################################
 # Sequence of distributions
 # X_t = Normal(1+t) 
+device = 'cuda:1'
 N = 99
 tsteps = 100
 d = 5
@@ -436,12 +437,44 @@ losses = celldelta.optimize_initial_conditions(X0, ts, p0_noise=noise0,
 start = time.time()
 n_samples = 1000
 pt_alpha = None
-fokker_planck_alpha = 1
+fokker_planck_alpha = None
 l_max_alpha = None
 ux_lr  = 1e-4
 pxt_lr = 1e-4
 
-celldelta.pxt.model.set_tscale(500)
+celldelta.pxt.model.set_tscale(100)
+
+losses = celldelta.optimize(X, X0_mask, ts,
+                            pxt_lr=pxt_lr, 
+                            ux_lr=ux_lr,
+                            n_epochs=2500, n_samples=n_samples, 
+                            px_noise=noise, p0_noise=None, 
+                            fokker_planck_alpha=fokker_planck_alpha,
+                            pt_alpha=pt_alpha, 
+                            l_max_alpha=l_max_alpha,
+                            verbose=True)
+
+end = time.time()
+print(f'Time elapsed: {end-start:.2f}s')
+#%%
+fokker_planck_alpha = 1
+
+_=celldelta.optimize_fokker_planck(X, ts,
+                                   ux_lr=1e-3,
+                                   fokker_planck_alpha=fokker_planck_alpha,
+                                   noise=None,
+                                   n_epochs=1000, 
+                                   n_samples=n_samples,
+                                   verbose=True)
+
+#%%
+start = time.time()
+n_samples = 1000
+pt_alpha = None
+fokker_planck_alpha = 1
+l_max_alpha = None
+ux_lr  = 1e-4
+pxt_lr = 1e-4
 
 losses = celldelta.optimize(X, X0_mask, ts,
                             pxt_lr=pxt_lr, 
@@ -456,16 +489,7 @@ losses = celldelta.optimize(X, X0_mask, ts,
 end = time.time()
 print(f'Time elapsed: {end-start:.2f}s')
 
-#%%
-fokker_planck_alpha = 1
 
-_=celldelta.optimize_fokker_planck(X, ts,
-                                   ux_lr=1e-3,
-                                   fokker_planck_alpha=fokker_planck_alpha,
-                                   noise=None,
-                                   n_epochs=1000, 
-                                   n_samples=n_samples,
-                                   verbose=True)
 #%%
 fokker_planck_alpha = 1000
 for fp_noise_scale in np.linspace(0.01, 10, 10):
@@ -505,20 +529,24 @@ plt.colorbar(axs[0].collections[0], ax=axs[0])
 # Plot the histogram of differences from the true pseudotime
 pt = pxts.argmax(axis=1).reshape((N,-1))
 true_pt = np.arange(0,ts.shape[0],dtype=int).repeat(N).reshape(tsteps,N).T
-diffs = np.abs(pt-true_pt).flatten()
+diffs = (pt-true_pt).flatten()
 diffs = np.sort(diffs)
-axs[1].hist(diffs, bins=np.arange(0,diffs.max()))
+axs[1].hist(diffs, bins=np.arange(diffs.min(),diffs.max()))
 axs[1].set_title('Count of differences of estimated versus true pseudotime')
+# Set the ticks of the x-axis to be in the middle of the bins
+axs[1].set_xticks(np.arange(diffs.min(),diffs.max())+0.5, 
+                  labels=np.arange(diffs.min(),diffs.max()))
 
 # Make a empirical cumulative distribution of the differences
-n = diffs.shape[0]
-axs[2].plot(diffs, np.arange(0,n)/n)
+abs_diffs = np.sort(np.abs(diffs))
+n = abs_diffs.shape[0]
+axs[2].plot(abs_diffs, np.arange(0,n)/n)
 axs[2].axhline(0.95, c='red', linestyle='--', linewidth=1)
-pct95 = diffs[np.where(np.arange(0,n)/n > .95)[0][0]]
+pct95 = abs_diffs[np.where(np.arange(0,n)/n > .95)[0][0]]
 axs[2].axvline(pct95, c='red', linestyle='--', linewidth=1)
 # Label the 95th percentile, pad the label so it doesn't overlap with the line
-axs[2].text(pct95+diffs.max()/100, 0, f'95th pct={pct95:d}')
-axs[2].set_title('Empirical CDF of differences of estimated versus true pseudotime')
+axs[2].text(pct95+abs_diffs.max()/100, 0, f'95th pct={pct95:d}')
+axs[2].set_title('Empirical CDF of absolute differences of estimated versus true pseudotime')
 
 #%%
 # Plot the predicted p(x,t) for each cell at each timestep t
@@ -615,7 +643,7 @@ x = x0
 
 zero_boundary = False
 max_t = 1
-sigma=.1
+sigma=0.0
 xts = celldelta.simulate(x, tsim=torch.linspace(0, max_t, 100, device=device)*tscale,
                          zero_boundary=zero_boundary, sigma=sigma)
 
