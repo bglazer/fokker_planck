@@ -429,8 +429,8 @@ noise0 = D.MultivariateNormal(mean0, cov0)
 
 #%%
 # Train the model
-losses = celldelta.optimize_initial_conditions(X0, ts, p0_noise=noise, 
-                                               scale=1/ts.shape[0],
+losses = celldelta.optimize_initial_conditions(X0, ts, p0_noise=noise0, 
+                                               scale=1,
                                                pxt_lr=1e-3,
                                                n_epochs=600, 
                                                verbose=True)
