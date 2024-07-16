@@ -2,67 +2,8 @@ import torch
 from torch.nn import Linear, LeakyReLU, BatchNorm1d
 import torch.nn as nn
 import numpy as np
+import torch.nn.functional as F
 
-class MLP(torch.nn.Module):
-    """
-        Generic Dense Multi-Layer Perceptron (MLP), which is just a stack of linear layers with ReLU activations
-        
-        Args:
-            input_dim (int): dimension of input
-            output_dim (int): dimension of output
-            hidden_dim (int): dimension of hidden layers
-            num_layers (int): number of hidden layers
-            input_bias (bool, optional): whether to include a bias term in the input layer. Defaults to True.
-            tscale (int, optional): time scaling factor. Defaults to 1.
-            batch_norm (bool, optional): whether to include batch normalization layers. Defaults to False.
-        Returns:
-            None
-    """
-    def __init__(self, input_dim, output_dim, hidden_dim, num_layers, input_bias=True, tscale=1, batch_norm=False):
-        super(MLP, self).__init__()
-        layers = []
-        # First Linear layer
-        layers.append(Linear(input_dim, hidden_dim, bias=input_bias))
-        if batch_norm:
-            # BatchNorm1d after the first Linear layer
-            layers.append(BatchNorm1d(hidden_dim))
-        layers.append(LeakyReLU())
-        for i in range(num_layers - 1):
-            layers.append(Linear(hidden_dim, hidden_dim, bias=True))
-            if batch_norm:
-                # BatchNorm1d after each subsequent Linear layer
-                layers.append(BatchNorm1d(hidden_dim))
-            layers.append(LeakyReLU())
-        # Last Linear layer without BatchNorm1d after it
-        layers.append(Linear(hidden_dim, output_dim, bias=True))
-        self.layers = torch.nn.ModuleList(layers)
-        self.tscale = torch.ones(input_dim)
-        self.tscale[-1] = tscale
-        self.tscale = torch.nn.Parameter(self.tscale, requires_grad=False)
-
-    def set_tscale(self, tscale):
-        """
-        Set the time scaling factor for the model
-        """
-        self.tscale[-1] = tscale
-
-    def forward(self, x):
-        # Scale the weights linear layer connected to the last element of the input by the time scale
-        layer0 = self.layers[0]
-        w = layer0.weight
-        b = layer0.bias
-        s = x.shape
-        # Flatten the time and data dimensions so that it's a single big batch
-        x = x.reshape(-1, x.shape[-1])
-        x = ((x*self.tscale) @ w.T + b)  # Perform the original operation
-
-        for layer in self.layers[1:]:  # Corrected to start from the second layer
-            x = layer(x)
-
-        # Reshape to restore time and data dimensions
-        x = x.reshape(s[:-1] + (-1,))
-        return x
-            
 class Ux(torch.nn.Module):
     """
     The u(x) drift term of the Fokker-Planck equation, modeled by a neural network
@@ -79,11 +20,32 @@ class Ux(torch.nn.Module):
         """
         super(Ux, self).__init__()
         # The drift term of the Fokker-Planck equation, modeled by a neural network
-        self.model = MLP(input_dim, input_dim, hidden_dim, n_layers, batch_norm=batch_norm)
+        layers = []
+        # First Linear layer
+        if batch_norm:
+            layers.append(BatchNorm1d(input_dim, affine=True))
+        layers.append(Linear(input_dim, hidden_dim, bias=True))
+        if batch_norm:
+            layers.append(BatchNorm1d(hidden_dim, affine=True))
+        layers.append(LeakyReLU())
+        for i in range(n_layers - 1):
+            layers.append(Linear(hidden_dim, hidden_dim, bias=True))
+            if batch_norm:
+                layers.append(BatchNorm1d(hidden_dim, affine=True))
+            layers.append(LeakyReLU())  
+        # Last Linear layer without BatchNorm1d after it
+        layers.append(Linear(hidden_dim, input_dim, bias=True))
+        self.layers = torch.nn.Sequential(*layers)
+        self.batch_norm = batch_norm
+        self.model = torch.nn.Sequential(*layers)
 
     def forward(self, x):
-        # NOTE this works better in high dimensions when it's negative???
-        return self.model(x)
+        s = x.shape
+        x = x.reshape(-1, x.shape[-1])
+        x = self.model(x)
+        # Reshape to restore time and data dimensions
+        x = x.reshape(s[:-1] + (-1,))
+        return x
     
     def div(self, x):
         """
@@ -99,10 +61,10 @@ class Ux(torch.nn.Module):
                                        retain_graph=True, 
                                        create_graph=True)[0][:,i]
         return u, div
-    
+
 # The p(x,t) term of the Fokker-Planck equation, modeled by a neural network
 class Pxt(torch.nn.Module):
-    def __init__(self, input_dim, hidden_dim, n_layers, batch_norm=False):
+    def __init__(self, input_dim, hidden_dim, n_layers):
         """
         The p(x,t) term of the Fokker-Planck equation, modeled by a neural network
 
@@ -117,7 +79,19 @@ class Pxt(torch.nn.Module):
         super(Pxt, self).__init__()
 
         # Add another dimension to the input for time
-        self.model = MLP(input_dim+1, 1, hidden_dim, n_layers, batch_norm=batch_norm)
+        layers = []
+        # First Linear layer
+        layers.append(Linear(input_dim+1, hidden_dim, bias=True))
+        layers.append(LeakyReLU())
+        for i in range(n_layers - 1):
+            layers.append(Linear(hidden_dim, hidden_dim, bias=True))
+            layers.append(LeakyReLU())  
+        # Last Linear layer without BatchNorm1d after it
+        layers.append(Linear(hidden_dim, 1, bias=True))
+        self.layers = torch.nn.Sequential(*layers)
+        self.tscale = torch.ones(input_dim+1)
+        self.tscale = torch.nn.Parameter(self.tscale, requires_grad=False)
+        self.model = torch.nn.Sequential(*layers)
 
     def xts(self, x, ts):
         # Repeat the x and t vectors for each timestep in the ts range
@@ -138,9 +112,8 @@ class Pxt(torch.nn.Module):
         Returns:
             torch.tensor: The log probability of the data at each time and data point of shape (n_cells, n_timesteps).
         """
-
         xts = self.xts(x, ts)
-        log_ps = self.model(xts)
+        log_ps = self.forward(xts)
         return log_ps
     
     def pxt(self, x, ts):
@@ -149,8 +122,31 @@ class Pxt(torch.nn.Module):
         """
         return torch.exp(self.log_pxt(x, ts))
 
-    def forward(self, x, ts):
-        return self.log_pxt(x, ts)
+    def forward(self, xts):
+        # Scale the weights linear layer connected to the last element of the input by the time scale
+        x = xts
+        layer0 = self.layers[0]
+        w = layer0.weight
+        b = layer0.bias
+        s = x.shape
+        # Flatten the time and data dimensions so that it's a single big batch
+        x = x.reshape(-1, x.shape[-1])
+        # First layer with scaling factor
+        x = ((x*self.tscale) @ w.T + b)  
+
+         # Compute the remaining layers
+        for layer in self.layers[1:]: 
+            x = layer(x)
+
+        # Reshape to restore time and data dimensions
+        x = x.reshape(s[:-1] + (-1,))
+        return x
+    
+    def set_tscale(self, tscale):
+        """
+        Set the time scaling factor for the model
+        """
+        self.tscale[-1] = tscale
     
     def log_px(self, x, ts):
         """
@@ -167,7 +163,7 @@ class Pxt(torch.nn.Module):
             torch.tensor: The partial derivative of log p(x,t) with respect to t
         """
         xts = self.xts(x, ts)
-        log_pxt = self.model(xts)
+        log_pxt = self.forward(xts)
         dpdx = torch.autograd.grad(outputs=log_pxt, 
                                    inputs=xts, 
                                    grad_outputs=torch.ones_like(log_pxt), 
@@ -216,7 +212,7 @@ class CellDelta(nn.Module):
     def __init__(self, input_dim, 
                  ux_hidden_dim, ux_layers,
                  pxt_hidden_dim, pxt_layers,
-                 batch_norm=False,
+                 ux_batch_norm=False,
                  device='cpu') -> None:
         """
         Initialize the CellDelta model with the given hyperparameters.
@@ -234,8 +230,8 @@ class CellDelta(nn.Module):
             None
         """
         super().__init__()
-        self.ux = Ux(input_dim, ux_hidden_dim, ux_layers, batch_norm).to(device)
-        self.pxt = Pxt(input_dim, pxt_hidden_dim, pxt_layers, batch_norm).to(device)
+        self.ux = Ux(input_dim, ux_hidden_dim, ux_layers, ux_batch_norm).to(device)
+        self.pxt = Pxt(input_dim, pxt_hidden_dim, pxt_layers).to(device)
         self.device = device
         # Add the component models (ux, pxt, nce) to a module list
         self.models = torch.nn.ModuleDict({'ux':self.ux, 'pxt':self.pxt})
@@ -307,7 +303,59 @@ class CellDelta(nn.Module):
             l_ptn0 = torch.zeros(1, requires_grad=True).to(self.device)
         
         return l_pt0, l_ptn0
+    
+    def log_cosine_similarity(self, log_p, log_q):
+        dot_product = torch.logsumexp(log_p + log_q, dim=0)
+        norm_p = 0.5 * torch.logsumexp(2 * log_p, dim=0)
+        norm_q = 0.5 * torch.logsumexp(2 * log_q, dim=0)
+        return dot_product - norm_p - norm_q
+
+    def log_cosine_loss(self, X, ts):
+        log_pxt = self.pxt.log_pxt(X, ts)
+        loss = torch.zeros(1, requires_grad=True).to(self.device)
+        for i in range(1, log_pxt.shape[0]-1):
+            loss += self.log_cosine_similarity(log_pxt[i], log_pxt[i+1])
+        return loss
+    
+    def jensen_shannon(self, d1, d2):
+        """
+        Compute the Jensen-Shannon divergence between two distributions using log_softmax,
+        avoiding the use of exp for numerical stability.
+        """
+        # Compute log_softmax for d1 and d2
+        log_d1 = F.log_softmax(d1, dim=-1)
+        log_d2 = F.log_softmax(d2, dim=-1)
         
+        # Compute log of the mixture distribution
+        log_m = torch.logsumexp(torch.stack([log_d1, log_d2]), dim=0) - torch.log(torch.tensor(2.0))
+        
+        # Compute KL divergences in log space
+        kl_d1_m = F.kl_div(log_m, log_d1, reduction='batchmean', log_target=True)
+        kl_d2_m = F.kl_div(log_m, log_d2, reduction='batchmean', log_target=True)
+        
+        # Compute Jensen-Shannon divergence
+        js_div = 0.5 * (kl_d1_m + kl_d2_m)
+        
+        return js_div
+    
+    def entropy_loss(self, X, ts):
+        """
+        Penalize the entropy of the pseudtimes at each time point, using 
+        softmax to convert the log probabilities to pseudo-probabilities.
+        """
+        log_pxt = self.pxt.log_pxt(X, ts)
+        pxt = F.log_softmax(log_pxt, dim=1)  
+        
+        loss = torch.zeros(1, requires_grad=True).to(self.device)
+        for i in range(1,pxt.shape[0]-1):
+            loss += F.kl_div(pxt[i], pxt[i+1], 
+                             reduction='batchmean', 
+                             log_target=True)
+        
+        return -loss
+    
+    def entropy_loss2(self, X, ts):
+        return -F.softmax(self.pxt.log_pxt(X, ts), dim=0).var(0).mean()
 
     def fokker_planck_loss(self, x, ts):
         """
@@ -356,7 +404,7 @@ class CellDelta(nn.Module):
         Ensure that each timepoint has a similar mean probability to t=0
         """
         log_pxt = self.pxt.log_pxt(X, ts)
-        l_cons = (log_pxt.mean(1) - log_pxt[0].mean())**2
+        l_cons = (log_pxt[1:].mean(1) - log_pxt[0].mean())**2
         return l_cons.mean()
 
     def optimize(self, X, X0, X0_mask, ts, px_noise, p0_noise, p0_alpha=1,
@@ -364,6 +412,8 @@ class CellDelta(nn.Module):
                  l_max_alpha=None, 
                  l_consistency_alpha=None,
                  pt_alpha=None,
+                 entropy_alpha=None,
+                 p_alpha=None,
                  n_epochs=100, n_samples=1000, verbose=False):
         """
         Optimize the cell delta model parameters using the provided training data.
@@ -384,8 +434,8 @@ class CellDelta(nn.Module):
         Returns:
             dict: A dictionary containing the loss values for each epoch.
         """
-        self.pxt_optimizer = torch.optim.Adam(self.pxt.parameters(), lr=pxt_lr)
-        self.ux_optimizer = torch.optim.Adam(self.ux.parameters(), lr=ux_lr)
+        self.pxt_optimizer = torch.optim.Adam(self.pxt.parameters(), lr=pxt_lr, weight_decay=1e-3)
+        self.ux_optimizer = torch.optim.Adam(self.ux.parameters(), lr=ux_lr, weight_decay=1e-3)
 
         # Convenience variable for the time t=0
         zero = torch.zeros(1).to(self.device)
@@ -408,8 +458,12 @@ class CellDelta(nn.Module):
 
             # Calculate the Noise-Constrastive Loss of the distribution
             # of p(x,t) marginalized over t: p(x) = \int p(x,t) dt
-            l_nce_px, acc_px = self.nce_loss(x, px_noise, ts=ts, scale=1/ts.shape[0])
-            l_nce_px.backward()
+            if p_alpha is not None:
+                l_nce_px, acc_px = self.nce_loss(x, px_noise, ts=ts, scale=1/ts.shape[0])
+                l_nce_px.backward()
+            else:
+                l_nce_px = zero
+                acc_px = zero
             
             # Calculate the Noise-Constrastive Loss of the initial distribution
             if p0_alpha is not None:
@@ -434,7 +488,7 @@ class CellDelta(nn.Module):
                 l_max = zero
 
             if l_consistency_alpha is not None:
-                l_cons = self.consistency_loss(x, ts)
+                l_cons = self.consistency_loss(x, ts)*l_consistency_alpha
                 l_cons.backward()
             else:
                 l_cons = zero
@@ -449,6 +503,18 @@ class CellDelta(nn.Module):
                 l_pt0 = zero
                 l_ptn0 = zero
 
+            if entropy_alpha is not None:
+                l_entropy = self.log_cosine_loss(X, ts)*entropy_alpha
+                l_entropy.backward()
+            else:
+                l_entropy = zero
+
+            # ux_total_norm = torch.norm(torch.stack([torch.norm(p.grad.detach(), 2) for p in self.ux.model.parameters() if p.requires_grad]), 2)
+            # pxt_total_norm = torch.norm(torch.stack([torch.norm(p.grad.detach(), 2) for p in self.pxt.model.parameters() if p.requires_grad]), 2)
+            # print(f'ux total norm: {ux_total_norm}, pxt total norm: {pxt_total_norm}')
+
+            # torch.nn.utils.clip_grad_norm_(self.ux.model.parameters(), max_norm=1.0)
+            # torch.nn.utils.clip_grad_norm_(self.pxt.model.parameters(), max_norm=1.0)
 
             self.pxt_optimizer.step()
             self.ux_optimizer.step()
@@ -462,6 +528,7 @@ class CellDelta(nn.Module):
                     f'l_nce_p0={float(l_nce_p0): .5f}, '
                     f'acc_p0={float(acc_p0): .5f}, '
                     f'l_fp={float(l_fp):.5f}, '
+                    f'l_entropy={float(l_entropy):.5f}, '
                     f'l_cons={float(l_cons):.5f}, '
                     f'l_pt0={float(l_pt0):.5f}, '
                     f'l_ptn0={float(l_ptn0):.5f} '
