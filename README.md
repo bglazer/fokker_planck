@@ -19,9 +19,9 @@ where:
 * $\Delta$ is the Laplacian
 * $D$ is a constant diffusion term
 
-We train a neural network $f_p(x,t)$ (`pxt` in the code) to learn the initial distribution $p(\hat x_0)$ and $p(\hat x) = \frac{1}{T} \sum_0^{T} p(\hat x, t)$ and  using noise contrastive estimation [1]. However, this is prone to learning a degenerate solution with $p(x,0)= p(x)$ and $p(x, t \neq 0) =0$, so we add a loss term to enforce a "consistency" condition
+We train a neural network $f_p(x,t)$ (`pxt` in the code) to learn the initial distribution $p(\hat x_0)$ and $p(\hat x) = \frac{1}{T} \sum_0^{T} p(\hat x, t)$ and  using noise contrastive estimation [1]. However, this is prone to learning a degenerate solution with $p(x,0)= p(x)$ and $p(x, t \neq 0) =0$, so we add a loss term to enforce a "consistency" condition: 
 
-$$\mathcal{L}_{cons} = \left\|\sum_{\hat x}p(x, t_i) - \sum_{\hat x}p(x, t_j)\right\|^2$$
+$$\mathcal{L} = \left\|\sum_{\hat x}p(x, t_i) - \sum_{\hat x}p(x, t_j)\right\|^2$$
 
 While knowing the $p(x,t)$ is useful, our primary goal is to learn the vector field that drives the dynamics, i.e. the $u(x)$ above. To do this, we model the drift as another neural network $f_u$ (`ux` in the code) add the Fokker-Planck equation as a loss term:
 
