@@ -19,11 +19,11 @@ where:
 * $\Delta$ is the Laplacian
 * $D$ is a constant diffusion term
 
-We train a neural network $f_p(x,t)$ (`pxt` in the code) to learn the initial distribution $p(\hat x_0)$ and $p(\hat x) = \frac{1}{T} \sum_0^{T} p(\hat x, t)$ and  using noise contrastive estimation [1]. However, this is prone to learning a degenerate solution with $p(x,0)= p(x)$ and $p(x, t \neq 0) =0$, so we add a loss term to enforce a "consistency" condition 
+We train a neural network $f_p(x,t)$ (`pxt` in the code) to learn the initial distribution $p(\hat x_0)$ and $p(\hat x) = \frac{1}{T} \sum_0^{T} p(\hat x, t)$ and  using noise contrastive estimation [1]. However, this is prone to learning a degenerate solution with $p(x,0)= p(x)$ and $p(x, t \neq 0) =0$, so we add a loss term to enforce a "consistency" condition
 
-$$\mathcal{L}_{cons} = \left\|\sum_{\hat x}p(x, t_i) - \sum_{\hat x}p(x, t_j)\right\|^2 $$ 
+$$\mathcal{L}_{cons} = \left\|\sum_{\hat x}p(x, t_i) - \sum_{\hat x}p(x, t_j)\right\|^2$$
 
-However, the real goal is to learn the vector field that drives the dynamics, i.e. the $u(x)$ above. To do this, we model the drift as another neural network $f_u$ (`ux` in the code) add the Fokker-Planck equation as a loss term:
+While knowing the $p(x,t)$ is useful, our primary goal is to learn the vector field that drives the dynamics, i.e. the $u(x)$ above. To do this, we model the drift as another neural network $f_u$ (`ux` in the code) add the Fokker-Planck equation as a loss term:
 
 $$\mathcal{L}_{FP} = \left\|\frac{\partial p(x,t)}{\partial t} + \nabla \cdot (u(x)p(x,t))\right\|^2$$
 
@@ -32,11 +32,11 @@ assuming that the diffusion term is constant.
 
 So, the overall loss is then: 
 
-$$ \mathcal{L}_p + \mathcal{L}_{p0} + \mathcal{L}_{FP} + \mathcal{L}_{cons} $$
+$$ \mathcal{L}_p + \mathcal{L}_{p0} + \mathcal{L}_{FP} + \mathcal{L}_{cons}$$
 
 where :
 * $\mathcal{L}_p$ is the NCE loss of estimating $p(\hat x)$
-* $\mathcal{L}_p0$ is the NCE loss of estimating $p(\hat x_0)$
+* $\mathcal{L}_{p0}$ is the NCE loss of estimating $p(\hat x_0)$
 * $\mathcal{L}_{FP}$ is the Fokker-Planck consistency loss
 * $\mathcal{L}_{cons}$ is the time density consistency loss
 
