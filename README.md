@@ -1,19 +1,27 @@
 # Fokker-Planck Constrained Density Estimation for Single Cell Dynamics
 ## Mathematical statement of the problem
 Given a sample $\hat x$ from a distribution $p(X)$, we assume that a subset of that sample $\hat x_0$ is the drawn from an initial state distribution $p_0(X)$. We assume that $p(X)$ is the mean density of a time varying distribution. 
-$$p(x) = \frac{1}{T}\int_{0}^{T} p(x,t) dt$$ We assume that $X_t$ is determined by a stochastic differential equation:
+
+$$p(x) = \frac{1}{T}\int_{0}^{T} p(x,t) dt$$ 
+
+We assume that $X_t$ is determined by a stochastic differential equation:
 $$dX_t = u(x)dt + \sigma dW$$ where 
 * u(x) is a time-independent drift term
 * $\sigma$ is a constant diffusion coefficient
 * W is Wiener process (Gaussian noise)
 
 The evolution of p(x,t) then follows a Fokker-Planck equation
-$$\frac{\partial p(x,t)}{\partial t} = -\nabla \cdot (u(x)p(x,t)) + \Delta Dp(x,t)$$ where: 
+
+$$\frac{\partial p(x,t)}{\partial t} = -\nabla \cdot (u(x)p(x,t)) + \Delta Dp(x,t)$$ 
+
+where: 
 * $\nabla$ is the divergence w.r.t. $x$ 
 * $\Delta$ is the Laplacian
 * $D$ is a constant diffusion term
 
-We train a neural network $f_p(x,t)$ (`pxt` in the code) to learn the initial distribution $p(\hat x_0)$ and $p(\hat x) = \frac{1}{T} \sum_0^{T} p(\hat x, t)$ and  using noise contrastive estimation [1]. However, this is prone to learning a degenerate solution with $p(x,0)= p(x)$ and $p(x, t \neq 0) =0$, so we add a loss term to enforce a "consistency" condition $$\mathcal{L}_{cons} = \left\|\sum_{\hat x}p(x, t_i) - \sum_{\hat x}p(x, t_j)\right\|^2\forall i,j$$ 
+We train a neural network $f_p(x,t)$ (`pxt` in the code) to learn the initial distribution $p(\hat x_0)$ and $p(\hat x) = \frac{1}{T} \sum_0^{T} p(\hat x, t)$ and  using noise contrastive estimation [1]. However, this is prone to learning a degenerate solution with $p(x,0)= p(x)$ and $p(x, t \neq 0) =0$, so we add a loss term to enforce a "consistency" condition 
+
+$$\mathcal{L}_{cons} = \left\|\sum_{\hat x}p(x, t_i) - \sum_{\hat x}p(x, t_j)\right\|^2\forall i,j$$ 
 
 However, the real goal is to learn the vector field that drives the dynamics, i.e. the $u(x)$ above. To do this, we model the drift as another neural network $f_u$ (`ux` in the code) add the Fokker-Planck equation as a loss term:
 $$\mathcal{L}_{FP} = \left\|\frac{\partial p(x,t)}{\partial t} + \nabla \cdot (u(x)p(x,t))\right\|^2$$
