@@ -269,74 +269,6 @@ class CellDelta(nn.Module):
         acc = ((r_x > 1/2).sum() + (r_y > 1/2).sum()).cpu().numpy() / (len(x) + len(y))
         
         return -v, acc
-
-    def pseudotime_loss(self, X, X0_mask, ts):
-        """
-        Penalize data points in the initial state that are not at the beginning of the pseudotime trajectory.
-        Also penalize data points that are not in the initial state that have a pseudotime of 0.
-
-        Args:
-            X0 (torch.Tensor): The initial state of the cells of shape (n_cells, n_genes).
-            ts (torch.Tensor): The time points at which to evaluate the model of shape (n_timesteps,).
-        """
-
-        log_pxt = self.pxt.log_pxt(X, ts)
-        log_pxt0 = log_pxt[:, X0_mask]
-        log_pxtn0 = log_pxt[:, ~X0_mask]
-        # Calculate the pseudotime of the initial state
-        # Pseudotime is the timestep of max probability
-        pt0 = torch.argmax(log_pxt0, dim=0).flatten()
-        ptn0 = torch.argmax(log_pxtn0, dim=0).flatten()
-
-        # Penalize data points in the initial state that don't have a pseudotime of 0
-        if (pt0 != 0).any():
-            l_pt0 = log_pxt0[pt0[pt0!=0],pt0!=0].mean()
-            l_pt0 -= log_pxt0[torch.zeros_like(pt0[pt0!=0]),pt0!=0].mean()
-        else:
-            l_pt0 = torch.zeros(1, requires_grad=True).to(self.device)
-
-        # Penalize data points not in the initial state that have a pseudotime of 0
-        if (pt0 == 0).any():
-            l_ptn0 = log_pxtn0[:,ptn0==0].mean()/((ptn0!=0).sum()+1)
-            print(((ptn0!=0).sum()+1).item())
-        else:
-            l_ptn0 = torch.zeros(1, requires_grad=True).to(self.device)
-        
-        return l_pt0, l_ptn0
-    
-    def log_cosine_similarity(self, log_p, log_q):
-        dot_product = torch.logsumexp(log_p + log_q, dim=0)
-        norm_p = 0.5 * torch.logsumexp(2 * log_p, dim=0)
-        norm_q = 0.5 * torch.logsumexp(2 * log_q, dim=0)
-        return dot_product - norm_p - norm_q
-
-    def log_cosine_loss(self, X, ts):
-        log_pxt = self.pxt.log_pxt(X, ts)
-        loss = torch.zeros(1, requires_grad=True).to(self.device)
-        for i in range(1, log_pxt.shape[0]-1):
-            loss += self.log_cosine_similarity(log_pxt[i], log_pxt[i+1])
-        return loss
-    
-    def jensen_shannon(self, d1, d2):
-        """
-        Compute the Jensen-Shannon divergence between two distributions using log_softmax,
-        avoiding the use of exp for numerical stability.
-        """
-        # Compute log_softmax for d1 and d2
-        log_d1 = F.log_softmax(d1, dim=-1)
-        log_d2 = F.log_softmax(d2, dim=-1)
-        
-        # Compute log of the mixture distribution
-        log_m = torch.logsumexp(torch.stack([log_d1, log_d2]), dim=0) - torch.log(torch.tensor(2.0))
-        
-        # Compute KL divergences in log space
-        kl_d1_m = F.kl_div(log_m, log_d1, reduction='batchmean', log_target=True)
-        kl_d2_m = F.kl_div(log_m, log_d2, reduction='batchmean', log_target=True)
-        
-        # Compute Jensen-Shannon divergence
-        js_div = 0.5 * (kl_d1_m + kl_d2_m)
-        
-        return js_div
     
     def entropy_loss(self, X, ts):
         """
@@ -354,9 +286,6 @@ class CellDelta(nn.Module):
         
         return -loss
     
-    def entropy_loss2(self, X, ts):
-        return -F.softmax(self.pxt.log_pxt(X, ts), dim=0).var(0).mean()
-
     def fokker_planck_loss(self, x, ts):
         """
         This is the calculation of the term that ensures the derivatives match the log scale Fokker-Planck equation
@@ -389,15 +318,6 @@ class CellDelta(nn.Module):
         ts.requires_grad = False
         
         return l_fp
-    
-    def max_consistency_loss(self, X, ts):
-        """
-        Ensure that each timepoint has a similar max probability
-        """
-        log_pxt = self.pxt.log_pxt(X, ts)
-        max_log_pxt = log_pxt.max(dim=1)[0]
-        l_max = (max_log_pxt - max_log_pxt.mean())**2
-        return l_max.mean()
     
     def consistency_loss(self, X, ts):
         """
