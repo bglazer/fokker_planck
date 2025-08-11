@@ -327,12 +327,9 @@ class CellDelta(nn.Module):
         l_cons = (log_pxt[1:].mean(1) - log_pxt[0].mean())**2
         return l_cons.mean()
 
-    def optimize(self, X, X0, X0_mask, ts, px_noise, p0_noise, p0_alpha=1,
+    def optimize(self, X, X0, ts, px_noise, p0_noise, p0_alpha=1,
                  pxt_lr=5e-4, ux_lr=1e-3, fokker_planck_alpha=1, 
-                 l_max_alpha=None, 
                  l_consistency_alpha=None,
-                 pt_alpha=None,
-                 entropy_alpha=None,
                  p_alpha=None,
                  n_epochs=100, n_samples=1000, verbose=False):
         """
@@ -401,33 +398,11 @@ class CellDelta(nn.Module):
             else:
                 l_fp = zero
 
-            if l_max_alpha is not None:
-                l_max = self.max_consistency_loss(x, ts)
-                l_max.backward()
-            else:
-                l_max = zero
-
             if l_consistency_alpha is not None:
                 l_cons = self.consistency_loss(x, ts)*l_consistency_alpha
                 l_cons.backward()
             else:
                 l_cons = zero
-
-            if pt_alpha is not None:
-                l_pt0, l_ptn0 = self.pseudotime_loss(X, X0_mask, ts)
-                l_pt0 = l_pt0 * pt_alpha
-                l_ptn0 = l_ptn0 * pt_alpha
-                l_pt0.backward(retain_graph=True)
-                l_ptn0.backward()
-            else:
-                l_pt0 = zero
-                l_ptn0 = zero
-
-            if entropy_alpha is not None:
-                l_entropy = self.log_cosine_loss(X, ts)*entropy_alpha
-                l_entropy.backward()
-            else:
-                l_entropy = zero
 
             # ux_total_norm = torch.norm(torch.stack([torch.norm(p.grad.detach(), 2) for p in self.ux.model.parameters() if p.requires_grad]), 2)
             # pxt_total_norm = torch.norm(torch.stack([torch.norm(p.grad.detach(), 2) for p in self.pxt.model.parameters() if p.requires_grad]), 2)
@@ -448,10 +423,7 @@ class CellDelta(nn.Module):
                     f'l_nce_p0={float(l_nce_p0): .5f}, '
                     f'acc_p0={float(acc_p0): .5f}, '
                     f'l_fp={float(l_fp):.5f}, '
-                    f'l_entropy={float(l_entropy):.5f}, '
                     f'l_cons={float(l_cons):.5f}, '
-                    f'l_pt0={float(l_pt0):.5f}, '
-                    f'l_ptn0={float(l_ptn0):.5f} '
                     )
                 
         return {'l_nce_px': l_nce_pxs, 'l_nce_p0': l_nce_p0s, 'l_fp': l_fps}
