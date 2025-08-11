@@ -4,204 +4,143 @@ import torch.nn as nn
 import numpy as np
 import torch.nn.functional as F
 
-class Ux(torch.nn.Module):
-    """
-    The u(x) drift term of the Fokker-Planck equation, modeled by a neural network
-    """
-    def __init__(self, input_dim, hidden_dim, n_layers, batch_norm=False):
-        """
-        Args:
-            input_dim (int): The dimensionality of the data.
-            hidden_dim (int): The number of hidden units in each layer.
-            n_layers (int): The number of layers in the model.
+import torch
+import torch.nn as nn
+from torch.autograd import grad
 
-        Returns:
-            None
-        """
-        super(Ux, self).__init__()
-        # The drift term of the Fokker-Planck equation, modeled by a neural network
-        layers = []
-        # First Linear layer
-        if batch_norm:
-            layers.append(BatchNorm1d(input_dim, affine=True))
-        layers.append(Linear(input_dim, hidden_dim, bias=True))
-        if batch_norm:
-            layers.append(BatchNorm1d(hidden_dim, affine=True))
-        layers.append(LeakyReLU())
-        for i in range(n_layers - 1):
-            layers.append(Linear(hidden_dim, hidden_dim, bias=True))
-            if batch_norm:
-                layers.append(BatchNorm1d(hidden_dim, affine=True))
-            layers.append(LeakyReLU())  
-        # Last Linear layer without BatchNorm1d after it
-        layers.append(Linear(hidden_dim, input_dim, bias=True))
-        self.layers = torch.nn.Sequential(*layers)
-        self.batch_norm = batch_norm
-        self.model = torch.nn.Sequential(*layers)
+# -----------------------------
+# Utilities
+# -----------------------------
 
-    def forward(self, x):
-        s = x.shape
-        x = x.reshape(-1, x.shape[-1])
-        x = self.model(x)
-        # Reshape to restore time and data dimensions
-        x = x.reshape(s[:-1] + (-1,))
-        return x
-    
-    def div(self, x):
-        """
-        Compute the divergence of u(x) with respect to x. Divergence is the sum of the 
-        partial derivatives of each component of u(x) with respect to each element of x.
-        \sum_{i=1}^{N} du_i(x)/dx_i
-        """
-        u = self.model(x)
-        div = torch.zeros_like(x[:,0])
-        for i in range(u.shape[1]):
-            div += torch.autograd.grad(u[:,i], x, 
-                                       torch.ones_like(u[:,i]), 
-                                       retain_graph=True, 
-                                       create_graph=True)[0][:,i]
-        return u, div
+def rademacher_like(t):
+    # +/- 1 with equal prob
+    return (torch.randint_like(t, low=0, high=2, dtype=torch.long) * 2 - 1).to(dtype=t.dtype)
 
-# The p(x,t) term of the Fokker-Planck equation, modeled by a neural network
-class Pxt(torch.nn.Module):
+# -----------------------------
+# p(x,t): same as yours, small tweak in dx_dt
+# -----------------------------
+
+class Pxt(nn.Module):
     def __init__(self, input_dim, hidden_dim, n_layers):
-        """
-        The p(x,t) term of the Fokker-Planck equation, modeled by a neural network
-
-        Args:
-            input_dim (int): The dimensionality of the data.
-            hidden_dim (int): The number of hidden units in each layer.
-            n_layers (int): The number of layers in the model.
-        
-        Returns:
-            None
-        """
-        super(Pxt, self).__init__()
-
-        # Add another dimension to the input for time
+        super().__init__()
         layers = []
-        # First Linear layer
-        layers.append(Linear(input_dim+1, hidden_dim, bias=True))
-        layers.append(LeakyReLU())
-        for i in range(n_layers - 1):
-            layers.append(Linear(hidden_dim, hidden_dim, bias=True))
-            layers.append(LeakyReLU())  
-        # Last Linear layer without BatchNorm1d after it
-        layers.append(Linear(hidden_dim, 1, bias=True))
-        self.layers = torch.nn.Sequential(*layers)
-        self.tscale = torch.ones(input_dim+1)
-        self.tscale = torch.nn.Parameter(self.tscale, requires_grad=False)
-        self.model = torch.nn.Sequential(*layers)
+        layers.append(nn.Linear(input_dim + 1, hidden_dim, bias=True))
+        layers.append(nn.LeakyReLU())
+        for _ in range(n_layers - 1):
+            layers.append(nn.Linear(hidden_dim, hidden_dim, bias=True))
+            layers.append(nn.LeakyReLU())
+        layers.append(nn.Linear(hidden_dim, 1, bias=True))
+        self.layers = nn.ModuleList(layers)
+        self.model  = nn.Sequential(*layers)
+
+        # Optional time scaling (kept from your code, but off by default)
+        self.tscale = nn.Parameter(torch.ones(input_dim + 1), requires_grad=False)
 
     def xts(self, x, ts):
-        # Repeat the x and t vectors for each timestep in the ts range
-        xs = x.repeat((ts.shape[0],1,1,))
-        ts_ = ts.repeat((x.shape[0],1)).T.unsqueeze(2)
-        # Concatentate them together to match the input the MLP model
-        xts = torch.concatenate((xs,ts_), dim=2)
-        return xts
-
-    def log_pxt(self, x, ts):
-        """
-        Compute the log probability of the data at the given time points and data points.
-
-        Args:
-            x (torch.tensor): The input data of shape (n_batch, n_cells, n_genes).
-            ts (torch.tensor): The time points at which to evaluate the model of shape (n_timesteps,).
-        
-        Returns:
-            torch.tensor: The log probability of the data at each time and data point of shape (n_cells, n_timesteps).
-        """
-        xts = self.xts(x, ts)
-        log_ps = self.forward(xts)
-        return log_ps
-    
-    def pxt(self, x, ts):
-        """
-        Exponentiate the log probability of the data at the given time points and data points.
-        """
-        return torch.exp(self.log_pxt(x, ts))
+        # x: (B, D), ts: (T,)
+        xs  = x.repeat((ts.shape[0], 1, 1))           # (T, B, D)
+        ts_ = ts.repeat((x.shape[0], 1)).T.unsqueeze(2)  # (T, B, 1)
+        return torch.cat((xs, ts_), dim=2)            # (T, B, D+1)
 
     def forward(self, xts):
-        # Scale the weights linear layer connected to the last element of the input by the time scale
-        x = xts
+        # xts: (T, B, D+1)
+        s = xts.shape
+        x = xts.reshape(-1, xts.shape[-1])            # (T*B, D+1)
+        # first layer with optional scaling on inputs
         layer0 = self.layers[0]
-        w = layer0.weight
-        b = layer0.bias
-        s = x.shape
-        # Flatten the time and data dimensions so that it's a single big batch
-        x = x.reshape(-1, x.shape[-1])
-        # First layer with scaling factor
-        x = ((x*self.tscale) @ w.T + b)  
-
-         # Compute the remaining layers
-        for layer in self.layers[1:]: 
+        x = (x * self.tscale) @ layer0.weight.T + layer0.bias
+        for layer in self.layers[1:]:
             x = layer(x)
-
-        # Reshape to restore time and data dimensions
-        x = x.reshape(s[:-1] + (-1,))
+        x = x.reshape(s[:-1] + (-1,))                 # (T, B, 1)
         return x
-    
+
+    def log_pxt(self, x, ts):
+        return self.forward(self.xts(x, ts))
+
+    def pxt(self, x, ts):
+        return torch.exp(self.log_pxt(x, ts))
+
     def set_tscale(self, tscale):
-        """
-        Set the time scaling factor for the model
-        """
-        self.tscale[-1] = tscale
-    
+        self.tscale.data[-1] = tscale
+
     def log_px(self, x, ts):
-        """
-        Marginalize out the t dimension to get log(p(x))
-        """
-        return torch.logsumexp(self.log_pxt(x, ts), dim=0) 
+        return torch.logsumexp(self.log_pxt(x, ts), dim=0)
 
     def dx_dt(self, x, ts):
         """
-        Compute the partial derivative of log p(x,t) with respect to x and to t
-
         Returns:
-            torch.tensor: The partial derivative of log p(x,t) with respect to x
-            torch.tensor: The partial derivative of log p(x,t) with respect to t
+          dq_dx: (T, B, D)
+          dq_dt: (T, B, 1)
         """
         xts = self.xts(x, ts)
-        log_pxt = self.forward(xts)
-        dpdx = torch.autograd.grad(outputs=log_pxt, 
-                                   inputs=xts, 
-                                   grad_outputs=torch.ones_like(log_pxt), 
-                                   create_graph=True,
-                                   retain_graph=True)[0]
-        # The last element of the gradient is the derivative with respect to t
-        # The :-1 is to get the gradient with respect to x
-        # The -1: is to get the gradient with respect to t
-        return dpdx[...,:-1], dpdx[...,-1:]
-    
-    def sample(self, x0, n_steps, step_size, eps=None):
+        xts.requires_grad_(True)
+        q = self.forward(xts)                          # (T, B, 1)
+        g = grad(q, xts, grad_outputs=torch.ones_like(q),
+                 create_graph=True, retain_graph=True)[0]    # (T, B, D+1)
+        return g[..., :-1], g[..., -1:]               # (dq/dx, dq/dt)
+
+# -----------------------------
+# Potential flow: u = ∇_x φ(x,t), div u = Δ_x φ
+# -----------------------------
+
+class Phi(nn.Module):
+    """
+    Scalar potential φ(x). Drift u = ∇_x φ, divergence = Δ_x φ.
+    """
+    def __init__(self, input_dim, hidden_dim, n_layers, batch_norm=False):
+        super().__init__()
+        layers = []
+        def maybe_bn(d): 
+            return [nn.BatchNorm1d(d, affine=True)] if batch_norm else []
+
+        layers += maybe_bn(input_dim + 1)
+        layers += [nn.Linear(input_dim + 1, hidden_dim, bias=True)]
+        layers += maybe_bn(hidden_dim)
+        layers += [nn.LeakyReLU()]
+
+        for _ in range(n_layers - 1):
+            layers += [nn.Linear(hidden_dim, hidden_dim, bias=True)]
+            layers += maybe_bn(hidden_dim)
+            layers += [nn.LeakyReLU()]
+
+        layers += [nn.Linear(hidden_dim, 1, bias=True)]   # scalar φ
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x):
+        return self.net(x)
+
+    def u(self, x):
+        """Convenience: ∇_x φ(x) with grads disabled."""
+        with torch.no_grad():
+            return self.grad(x)
+
+    def grad(self, x):
+        """Compute the gradient ∇_x φ(x)"""
+        return grad(self.forward(x), x, create_graph=True)[0]
+
+    def grad_and_laplacian(self, x):
         """
-        MCMC sampling of the model
+        Compute u = ∇_x φ(x) and Δ_x φ.
+        Args:
+          x: (B, D)
+          estimator: "hutchinson" or "exact"
+          n_probe: probes for Hutchinson
+        Returns:
+          u:   (B, D)
+          lap: (B, 1)
         """
-        samples = torch.zeros((n_steps, x0.shape[0], x0.shape[1]), device=x0.device)
-        for i in range(n_steps):
-            # Sample from a normal distribution centered at
-            # the current state
-            d = torch.randn_like(x0)*step_size
-            # Add the delta to the current state
-            x0 = x0 + d
-            # Calculate the acceptance probability
-            p0 = self.log_prob(x0)
-            p1 = self.log_prob(x0 + d)
-            # Perturb the log probability if the eps parameter is given
-            if eps is not None:
-                p0 += eps
-                p1 += eps
-            # Accept or reject the new state
-            accept = torch.rand_like(p0) < torch.exp(p1 - p0)
-            # Update the state
-            x0 = torch.where(accept, x0+d, x0)
-            # Save the state
-            samples[i] = x0
-        samples = samples.reshape((-1, x0.shape[1]))
-        # Randomly pick N points from the samples
-        samples = samples[torch.randperm(len(samples))[:len(x0)]] 
-        return samples
+        u = self.grad(x)
+
+        # Δφ = sum_i ∂^2 φ / ∂x_i^2
+        lap = 0.0
+        for i in range(u.shape[-1]):
+            gi = u[..., i]                            
+            dgi_dxts = grad(gi, x, grad_outputs=torch.ones_like(gi),
+                            create_graph=True, retain_graph=True)[0]  
+            lap_i = dgi_dxts[..., i:i+1]             # pick derivative wrt x_i
+            lap = lap + lap_i
+
+        return u, lap
 
 class CellDelta(nn.Module):
     """
@@ -230,11 +169,12 @@ class CellDelta(nn.Module):
             None
         """
         super().__init__()
-        self.ux = Ux(input_dim, ux_hidden_dim, ux_layers, ux_batch_norm).to(device)
+        # self.phi = Ux(input_dim, ux_hidden_dim, ux_layers, ux_batch_norm).to(device)
+        self.phi = Phi(input_dim, ux_hidden_dim, ux_layers, batch_norm=False).to(device)
         self.pxt = Pxt(input_dim, pxt_hidden_dim, pxt_layers).to(device)
         self.device = device
         # Add the component models (ux, pxt, nce) to a module list
-        self.models = torch.nn.ModuleDict({'ux':self.ux, 'pxt':self.pxt})
+        self.models = torch.nn.ModuleDict({'phi':self.phi, 'pxt':self.pxt})
     
     def nce_loss(self, x, noise, ts, scale):
         """
@@ -269,56 +209,25 @@ class CellDelta(nn.Module):
         acc = ((r_x > 1/2).sum() + (r_y > 1/2).sum()).cpu().numpy() / (len(x) + len(y))
         
         return -v, acc
-    
-    def entropy_loss(self, X, ts):
-        """
-        Penalize the entropy of the pseudtimes at each time point, using 
-        softmax to convert the log probabilities to pseudo-probabilities.
-        """
-        log_pxt = self.pxt.log_pxt(X, ts)
-        pxt = F.log_softmax(log_pxt, dim=1)  
         
-        loss = torch.zeros(1, requires_grad=True).to(self.device)
-        for i in range(1,pxt.shape[0]-1):
-            loss += F.kl_div(pxt[i], pxt[i+1], 
-                             reduction='batchmean', 
-                             log_target=True)
-        
-        return -loss
-    
     def fokker_planck_loss(self, x, ts):
         """
-        This is the calculation of the term that ensures the derivatives match the log scale Fokker-Planck equation
-        q(x,t) = log p(x,t)
-        d/dt q(x,t) = \sum_{i=1}^{N} -[u(x)*dq(x,t)/dx_i + du(x)/dx]
-
-        u(x): The drift function
-        dq_dx: The derivative of the log probability with respect to x.
-        du_dx: The derivative of the drift term with respect to x.
-        
-        Args:
-            x (torch.Tensor): The input data of shape (n_cells, n_genes).
-            ts (torch.Tensor): The time points at which to evaluate the model of shape (n_timesteps,).
-
-        Returns:
-            torch.Tensor: The tensor representing loss enforcing constraint to the Fokker-Planck term.
+        Residual: r = dq/dt + u·∇q + div u,   with u = ∇φ,  div u = Δφ
+        Returns mean squared residual.
+        x:  (B, D)
+        ts: (T,)
         """
-        x.requires_grad = True
-        ts.requires_grad = True
-        
-        dq_dx, dq_dt = self.pxt.dx_dt(x, ts)
-        ux, div_ux = self.ux.div(x)
+        # score and time-derivative of q = log p
+        dq_dx, dq_dt = self.pxt.dx_dt(x, ts)  # (T,B,D), (T,B,1)
 
-        d_dx = ((dq_dx * ux).sum(dim=2) + div_ux)[...,None]
+        # potential drift and Laplacian
+        u, lap = self.phi.grad_and_laplacian(x)  # (B,D), (B,1)
 
-        # Enforce that dq_dt = -dx, i.e. that both sides of the fokker planck equation are equal
-        l_fp = ((d_dx + dq_dt)**2).mean()
-        
-        x.requires_grad = False
-        ts.requires_grad = False
-        
-        return l_fp
-    
+        # FP residual
+        residual = dq_dt + (u * dq_dx).sum(dim=-1, keepdim=True) + lap   # (T,B,1)
+
+        return (residual ** 2).mean()
+
     def consistency_loss(self, X, ts):
         """
         Ensure that each timepoint has a similar mean probability to t=0
@@ -352,7 +261,7 @@ class CellDelta(nn.Module):
             dict: A dictionary containing the loss values for each epoch.
         """
         self.pxt_optimizer = torch.optim.Adam(self.pxt.parameters(), lr=pxt_lr, weight_decay=1e-3)
-        self.ux_optimizer = torch.optim.Adam(self.ux.parameters(), lr=ux_lr, weight_decay=1e-3)
+        self.phi_optimizer = torch.optim.Adam(self.phi.parameters(), lr=ux_lr, weight_decay=1e-3)
 
         # Convenience variable for the time t=0
         zero = torch.zeros(1).to(self.device)
@@ -371,7 +280,7 @@ class CellDelta(nn.Module):
             x0 = X0.detach()
 
             self.pxt_optimizer.zero_grad()
-            self.ux_optimizer.zero_grad()
+            self.phi_optimizer.zero_grad()
 
             # Calculate the Noise-Constrastive Loss of the distribution
             # of p(x,t) marginalized over t: p(x) = \int p(x,t) dt
@@ -404,15 +313,8 @@ class CellDelta(nn.Module):
             else:
                 l_cons = zero
 
-            # ux_total_norm = torch.norm(torch.stack([torch.norm(p.grad.detach(), 2) for p in self.ux.model.parameters() if p.requires_grad]), 2)
-            # pxt_total_norm = torch.norm(torch.stack([torch.norm(p.grad.detach(), 2) for p in self.pxt.model.parameters() if p.requires_grad]), 2)
-            # print(f'ux total norm: {ux_total_norm}, pxt total norm: {pxt_total_norm}')
-
-            # torch.nn.utils.clip_grad_norm_(self.ux.model.parameters(), max_norm=1.0)
-            # torch.nn.utils.clip_grad_norm_(self.pxt.model.parameters(), max_norm=1.0)
-
             self.pxt_optimizer.step()
-            self.ux_optimizer.step()
+            self.phi_optimizer.step()
 
             # Record the losses
             l_nce_pxs[epoch] = float(l_nce_px.mean())
@@ -435,7 +337,7 @@ class CellDelta(nn.Module):
         """
         Optimize the Fokker-Planck component of the loss independently of the NCE component.
         """
-        self.ux_optimizer = torch.optim.Adam(self.ux.parameters(), lr=ux_lr)
+        self.phi_optimizer = torch.optim.Adam(self.phi.parameters(), lr=ux_lr)
 
         l_fps = np.zeros(n_epochs)
         l_fp0s = np.zeros(n_epochs)
@@ -456,7 +358,7 @@ class CellDelta(nn.Module):
                 x = x + normal.sample().unsqueeze(1)
 
             self.pxt_optimizer.zero_grad()
-            self.ux_optimizer.zero_grad()
+            self.phi_optimizer.zero_grad()
 
             # Calculate the Fokker-Planck loss
             l_fp = self.fokker_planck_loss(x, ts)*fokker_planck_alpha
@@ -467,7 +369,7 @@ class CellDelta(nn.Module):
             # l_fp0.backward()
             l_fp0 = torch.zeros(1).to(self.device)
 
-            self.ux_optimizer.step()
+            self.phi_optimizer.step()
 
             # Record the losses
             l_fps[epoch] = float(l_fp.mean())
@@ -522,7 +424,7 @@ class CellDelta(nn.Module):
         
         for i in range(len(tsim)):
             # Compute the drift term
-            u = self.ux(x)
+            u = self.phi
             # Compute the diffusion term
             # Generate a set of random numbers
             dW = torch.randn_like(x) * torch.sqrt(ht)
