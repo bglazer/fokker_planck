@@ -6,7 +6,7 @@ import numpy as np
 import torch
 import matplotlib
 import matplotlib.pyplot as plt
-import scanpy as sc
+# import scanpy as sc
 import torch.distributions as D
 from celldelta import CellDelta
 #%%

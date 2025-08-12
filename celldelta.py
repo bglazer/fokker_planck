@@ -1,20 +1,7 @@
 import torch
-from torch.nn import Linear, LeakyReLU, BatchNorm1d
 import torch.nn as nn
 import numpy as np
-import torch.nn.functional as F
-
-import torch
-import torch.nn as nn
 from torch.autograd import grad
-
-# -----------------------------
-# Utilities
-# -----------------------------
-
-def rademacher_like(t):
-    # +/- 1 with equal prob
-    return (torch.randint_like(t, low=0, high=2, dtype=torch.long) * 2 - 1).to(dtype=t.dtype)
 
 # -----------------------------
 # p(x,t): same as yours, small tweak in dx_dt
@@ -94,7 +81,7 @@ class Phi(nn.Module):
             return [nn.BatchNorm1d(d, affine=True)] if batch_norm else []
 
         layers += maybe_bn(input_dim + 1)
-        layers += [nn.Linear(input_dim + 1, hidden_dim, bias=True)]
+        layers += [nn.Linear(input_dim, hidden_dim, bias=True)]
         layers += maybe_bn(hidden_dim)
         layers += [nn.LeakyReLU()]
 
@@ -110,14 +97,16 @@ class Phi(nn.Module):
         return self.net(x)
 
     def u(self, x):
-        """Convenience: ∇_x φ(x) with grads disabled."""
-        with torch.no_grad():
-            return self.grad(x)
-
-    def grad(self, x):
         """Compute the gradient ∇_x φ(x)"""
-        return grad(self.forward(x), x, create_graph=True)[0]
-
+        x.requires_grad_(True)                            # make x a variable
+        y = self.forward(x)                                  # shape (N,1)
+        grad_outputs = torch.ones_like(y)                    # make gradient scalar
+        g = grad(y, x, grad_outputs=grad_outputs,
+                 create_graph=True, retain_graph=True)[0]
+        # x.requires_grad_(False)
+        return g
+    
+    
     def grad_and_laplacian(self, x):
         """
         Compute u = ∇_x φ(x) and Δ_x φ.
@@ -129,7 +118,7 @@ class Phi(nn.Module):
           u:   (B, D)
           lap: (B, 1)
         """
-        u = self.grad(x)
+        u = self.u(x)
 
         # Δφ = sum_i ∂^2 φ / ∂x_i^2
         lap = 0.0
@@ -151,7 +140,6 @@ class CellDelta(nn.Module):
     def __init__(self, input_dim, 
                  ux_hidden_dim, ux_layers,
                  pxt_hidden_dim, pxt_layers,
-                 ux_batch_norm=False,
                  device='cpu') -> None:
         """
         Initialize the CellDelta model with the given hyperparameters.
@@ -424,7 +412,7 @@ class CellDelta(nn.Module):
         
         for i in range(len(tsim)):
             # Compute the drift term
-            u = self.phi
+            u = self.phi.u(x)
             # Compute the diffusion term
             # Generate a set of random numbers
             dW = torch.randn_like(x) * torch.sqrt(ht)

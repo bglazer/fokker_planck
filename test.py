@@ -39,7 +39,7 @@ cd = CellDelta(input_dim=1,
                ux_hidden_dim=10, ux_layers=2, ux_dropout=0,
                pxt_hidden_dim=10, pxt_layers=2, pxt_dropout=0,
                noise=noise, device='cpu',)
-cd.ux_optimizer = torch.optim.Adam(cd.ux.parameters(), lr=0.001)
+cd.phi_optimizer = torch.optim.Adam(cd.ux.parameters(), lr=0.001)
 cd.pxt_optimizer = torch.optim.Adam(cd.ux.parameters(), lr=0.001)
 hx = 1e-3
 
@@ -52,7 +52,7 @@ for epoch in range(10):
     # x = X[rand_idxs]
     # x0 = X
     cd.pxt_optimizer.zero_grad()
-    cd.ux_optimizer.zero_grad()
+    cd.phi_optimizer.zero_grad()
 
     l_nce_p, acc_p = cd.nce_loss(x, ts=ts)
     l_nce_p.backward()
@@ -83,5 +83,5 @@ for epoch in range(10):
     l_fp.backward()
     print(float(l_fp))
     cd.pxt_optimizer.step()
-    cd.ux_optimizer.step()
+    cd.phi_optimizer.step()
 # %%

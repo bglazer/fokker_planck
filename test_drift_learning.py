@@ -6,7 +6,8 @@ import numpy as np
 import torch
 import matplotlib
 import matplotlib.pyplot as plt
-import scanpy as sc
+# import scanpy as sc
+from sklearn.decomposition import PCA
 import torch.distributions as D
 from celldelta import CellDelta
 import time
@@ -14,38 +15,38 @@ tonp = lambda x: x.detach().cpu().numpy()
 #%%
 # Create a celldelta model with a very simple u(x) model
 # u(x) is just a fixed linear function of x: [2*x_0, 3*x_1]
-class Ux(torch.nn.Module):
-    def __init__(self):
-        super(Ux, self).__init__()
-        self.ux = torch.tensor([[2, 3]], dtype=torch.float32, device='cpu')
+# class Ux(torch.nn.Module):
+#     def __init__(self):
+#         super(Ux, self).__init__()
+#         self.ux = torch.tensor([[2, 3]], dtype=torch.float32, device='cpu')
 
-    def forward(self, x):
-        return x**2 * self.ux + x[:,0,None]*x[:,1,None]
+#     def forward(self, x):
+#         return x**2 * self.ux + x[:,0,None]*x[:,1,None]
     
-celldelta = CellDelta(input_dim=2,
-                      ux_hidden_dim=1,
-                      ux_layers=1,
-                      pxt_hidden_dim=1,
-                      pxt_layers=1,
-                      device='cpu')
-celldelta.ux.model = Ux()
-#%%
-# Compute the Fokker-Planck term for a simple u(x) model
-# two dimensional x that's just two sequences from 1 to 10
-x = torch.arange(1, 11, dtype=torch.float32, device='cpu').repeat(2,1).T
-x.requires_grad = True
-ts = torch.linspace(0, 1, 10, device='cpu', requires_grad=True)
-dq_dx, dq_dt = celldelta.pxt.dx_dt(x, ts)
-ux, du_dx = celldelta.ux.div(x)
-d_dx = ((dq_dx * ux).sum(dim=2) + du_dx)[...,None]
-# Print the divergence of the drift term u(x)
-print(du_dx)
+# celldelta = CellDelta(input_dim=2,
+#                       ux_hidden_dim=1,
+#                       ux_layers=1,
+#                       pxt_hidden_dim=1,
+#                       pxt_layers=1,
+#                       device='cpu')
+# celldelta.phi.u.model = Ux()
+# #%%
+# # Compute the Fokker-Planck term for a simple u(x) model
+# # two dimensional x that's just two sequences from 1 to 10
+# x = torch.arange(1, 11, dtype=torch.float32, device='cpu').repeat(2,1).T
+# x.requires_grad = True
+# ts = torch.linspace(0, 1, 10, device='cpu', requires_grad=True)
+# dq_dx, dq_dt = celldelta.pxt.dx_dt(x, ts)
+# ux, du_dx = celldelta.phi.u.div(x)
+# d_dx = ((dq_dx * ux).sum(dim=2) + du_dx)[...,None]
+# # Print the divergence of the drift term u(x)
+# print(du_dx)
 
 # %%
 # One dimensional Gaussian sequence
 # Generate sequence of distributions
 # X_t = Normal(1+t) 
-device = 'cuda:1'
+device = 'cuda:0'
 N = 1000
 tsteps = 100
 X = torch.randn((N, tsteps), device=device)
@@ -75,8 +76,6 @@ n_samples = 1000
 celldelta = CellDelta(input_dim=1, device=device,
                       ux_hidden_dim=64, ux_layers=2, 
                       pxt_hidden_dim=64, pxt_layers=2,
-                      ux_batch_norm=True,
-                      pxt_batch_norm=False,
                       )
 mean = X.mean(dim=0, keepdim=False)
 cov = np.cov(X.cpu().numpy().T)
@@ -94,7 +93,7 @@ noise0 = D.MultivariateNormal(mean0, cov0)
 celldelta.train()
 pxt_lr = 1e-3
 losses = celldelta.optimize_initial_conditions(X0, ts, p0_noise=noise0, 
-                                               n_epochs=1500,
+                                               n_epochs=500,
                                                scale=1,#/ts.shape[0], 
                                                verbose=True)
 #%%
@@ -106,7 +105,6 @@ pxt_lr = 1e-3
 celldelta.train()
 losses = celldelta.optimize(X=X, 
                             X0=X0, 
-                            X0_mask=X0_mask, 
                             ts=ts,
                             pxt_lr=pxt_lr, 
                             ux_lr=ux_lr, 
@@ -141,7 +139,7 @@ xs = torch.arange(l, h, .01, device=device)[:,None]
 
 celldelta.eval()
 pxts = np.exp(celldelta.pxt.log_pxt(xs, ts).squeeze().T.cpu().detach().numpy())
-uxs = celldelta.ux(xs).squeeze().cpu().detach().numpy()
+uxs = celldelta.phi.u(xs).squeeze().cpu().detach().numpy()
 xs = xs.squeeze().cpu().detach().numpy()
 #%%
 # Plot the predicted p(x,t) at each timestep t
@@ -169,7 +167,7 @@ plt.legend();
 # %%
 # Plot the u(x) term for all x
 xs = torch.arange(l, h, .01, device=device)[:,None]
-uxs = celldelta.ux(xs).squeeze().cpu().detach().numpy()
+uxs = celldelta.phi.u(xs).squeeze().cpu().detach().numpy()
 xs = xs.squeeze().cpu().detach().numpy()
 fig, ax1 = plt.subplots(1,1, figsize=(10,5))
 plt.title('u(x) vs p(x)')
@@ -285,15 +283,15 @@ plt.legend();
 # Plot the dq_dx  and dq_dt terms for the Fokker-Planck equation
 xs = torch.arange(l, h, .01, device=device, requires_grad=True)[:,None]
 dq_dx, dq_dt = celldelta.pxt.dx_dt(xs, ts)
-du_dx = celldelta.ux.div(xs)[1]
-uxs = celldelta.ux(xs)
+du_dx = celldelta.phi.u.div(xs)[1]
+uxs = celldelta.phi.u(xs)
 d_dx = ((dq_dx * uxs).sum(2) + du_dx)[...,None]
 fp_err = (d_dx + dq_dt.sum(0))
 dq_dx = tonp(dq_dx)
 du_dx = tonp(du_dx)
 dq_dt = tonp(dq_dt)
 d_dx = tonp(d_dx)
-div_x = celldelta.ux.div(xs)[1]
+div_x = celldelta.phi.u.div(xs)[1]
 div_x = tonp(div_x)
 xs = tonp(xs)
 uxs = tonp(uxs)
@@ -344,12 +342,12 @@ for ax in axs:
 # %%
 # Plot the marginalized p(x) for each x
 plt.bar(data_bins[:-1], data_dist, width=w, alpha=.5, label='Data', color='green')
-plt.plot(xs, pxts.mean(axis=1), alpha=.4, label='Estimated p(x,t)', color='purple')
+plt.plot(tonp(xs), pxts.mean(axis=1), alpha=.4, label='Estimated p(x,t)', color='purple')
 plt.legend()
 #%%
 # Plot the histogram of differences from the true pseudotime
 fig, axs = plt.subplots(4,1, figsize=(10,20))
-pXt = celldelta.pxt(X, ts).squeeze().cpu().detach().numpy()
+pXt = celldelta.pxt.pxt(X, ts).squeeze().cpu().detach().numpy()
 pt = pXt.argmax(axis=0)
 true_pt = np.tile(np.arange(100), N)
 d = np.abs(pt-true_pt).flatten()
@@ -399,13 +397,11 @@ fig.tight_layout()
 #####################################################
 # Sequence of distributions
 # X_t = Normal(1+t) 
-# TODO Maybe we need to stretch the data so that the dq_dx
-# term gets smaller. Also, that would increase the magnitude of the
-# dq_dt term and the u(x) term
-device = 'cuda:1'
-N = 99
+
+device = 'cuda:0'
+N = 103
 tsteps = 100
-d = 50
+d = 5
 tscale = 10
 ts = torch.linspace(0, 1, tsteps, device=device)*tscale
 ts_np = ts.cpu().detach().numpy()
@@ -428,15 +424,13 @@ X0_mask[:,0] = True
 X0_mask = X0_mask.flatten()
 X0 = X[X0_mask].clone().detach()
 # Compute PCA of the data
-from sklearn.decomposition import PCA
 pca = PCA(n_components=2)
 x_proj = pca.fit_transform(X.cpu().numpy())
 # %%
 # Initialize the model
 celldelta = CellDelta(input_dim=d, device=device,
-                      ux_hidden_dim=64, ux_layers=2, 
-                      pxt_hidden_dim=64, pxt_layers=2,
-                      ux_batch_norm=True)
+                      ux_hidden_dim=64, ux_layers=0, 
+                      pxt_hidden_dim=64, pxt_layers=2)
 
 mean = X.mean(dim=0, keepdim=False)
 cov = np.cov(X.cpu().numpy().T)
@@ -451,8 +445,7 @@ noise0 = D.MultivariateNormal(mean0, cov0)
 
 #%%
 # Train the model
-celldelta.pxt.set_tscale(0)
-
+# celldelta.pxt.set_tscale(0)
 losses = celldelta.optimize_initial_conditions(X0, ts, p0_noise=noise0, 
                                                scale=1,
                                                pxt_lr=1e-3,
@@ -460,23 +453,19 @@ losses = celldelta.optimize_initial_conditions(X0, ts, p0_noise=noise0,
                                                verbose=True)
 
 #%%
-celldelta = celldelta.eval()
 start = time.time()
 n_samples = 1000
 p_alpha = 1
 p0_alpha = 1
-fokker_planck_alpha = None
+fokker_planck_alpha = 1
 l_consistency_alpha = .001
-pt_alpha = None
-entropy_alpha = None
 ux_lr  = 1e-4
 pxt_lr = 1e-4
 
-celldelta.pxt.set_tscale(1000)
+celldelta.pxt.set_tscale(100)
 
 losses = celldelta.optimize(X=X, 
                             X0=X0, 
-                            X0_mask=X0_mask,
                             ts=ts, 
                             pxt_lr=pxt_lr, 
                             ux_lr=ux_lr,
@@ -486,16 +475,13 @@ losses = celldelta.optimize(X=X,
                             px_noise=noise, 
                             fokker_planck_alpha=fokker_planck_alpha,
                             p0_alpha=p0_alpha, 
-                            pt_alpha=pt_alpha,
                             p_alpha=p_alpha,
                             l_consistency_alpha=l_consistency_alpha,
-                            entropy_alpha=entropy_alpha,
                             verbose=True)
 
 end = time.time()
 print(f'Time elapsed: {end-start:.2f}s')
 #%%
-celldelta = celldelta.train()
 fokker_planck_alpha = 1
 ux_lr = 1e-2
 
@@ -503,21 +489,21 @@ _=celldelta.optimize_fokker_planck(X, ts,
                                    ux_lr=ux_lr,
                                    fokker_planck_alpha=fokker_planck_alpha,
                                    noise=None,
-                                   n_epochs=5000, 
+                                   n_epochs=500, 
                                    n_samples=1e8,
                                    verbose=True)
 
 
-#%%
-fokker_planck_alpha = 1000
-for fp_noise_scale in np.linspace(0.01, 10, 10):
-    losses = celldelta.optimize_fokker_planck(X, ts,
-                                              ux_lr=1e-4,
-                                              fokker_planck_alpha=fokker_planck_alpha,
-                                              noise=fp_noise_scale,
-                                              n_epochs=1000, 
-                                              n_samples=n_samples,
-                                              verbose=True)
+# # %%
+# fokker_planck_alpha = 1
+# for fp_noise_scale in np.linspace(0.01, 10, 10):
+#     losses = celldelta.optimize_fokker_planck(X, ts,
+#                                               ux_lr=1e-4,
+#                                               fokker_planck_alpha=fokker_planck_alpha,
+#                                               noise=fp_noise_scale,
+#                                               n_epochs=1000, 
+#                                               n_samples=n_samples,
+#                                               verbose=True)
 # plt.plot(losses['l_fp'], label='l_fp')
 # plt.plot(losses['l_fp0'], label='l_fp0')
 
@@ -525,7 +511,7 @@ for fp_noise_scale in np.linspace(0.01, 10, 10):
 celldelta = celldelta.eval()
 xs = X.clone().detach()
 pxts = celldelta.pxt.log_pxt(xs, ts).squeeze().T.cpu().detach().numpy()
-uxs = celldelta.ux(xs).squeeze().cpu().detach().numpy()
+uxs = celldelta.phi.u(xs).squeeze().cpu().detach().numpy()
 # _, pxt_dts = celldelta.pxt.dx_dt(xs, ts)
 # pxt_dts = pxt_dts.detach().cpu().numpy()[:,:,0]
 
@@ -566,6 +552,16 @@ axs[2].axvline(pct95, c='red', linestyle='--', linewidth=1)
 # Label the 95th percentile, pad the label so it doesn't overlap with the line
 axs[2].text(pct95+abs_diffs.max()/100, 0, f'95th pct={pct95:d}')
 axs[2].set_title('Empirical CDF of absolute differences of estimated versus true pseudotime')
+
+#%%
+# Plot the scalar field at each point
+fig, axs = plt.subplots(1,1, figsize=(10,8)) 
+phi = tonp(celldelta.phi(X))
+axs.scatter(x_proj[:,0], x_proj[:,1], c=phi, cmap=viridis, s=1)
+plt.colorbar(axs.collections[0], ax=axs)
+axs.set_title('Scalar field $\phi(x)$')
+axs.set_xticks([])
+axs.set_yticks([])
 
 #%%
 # Plot the predicted p(x,t) for each cell at each timestep t
@@ -610,7 +606,7 @@ n_cells = 503
 random_idxs = torch.randperm(X.shape[0])[:n_cells]
 random_cells = X[random_idxs,:]
 # Get the drift term u(x) for each cell
-ux = celldelta.ux(X)
+ux = celldelta.phi.u(X)
 uxs = ux[random_idxs,:]
  
 # Add the uxs to the random_cells
@@ -633,23 +629,7 @@ for i in range(n_cells):
                  (random_drifts_proj[i,1] - random_cells_proj[i,1])*arrow_scale,
                  color='red', alpha=.5, width=.002)
 
-noise_vectors = False
-if noise_vectors:
-    noise_sample_size = 200
-    ux_noise_scale = 10
-    ux_noise = D.MultivariateNormal(torch.zeros(d, device=device), 
-                                    torch.eye(d, device=device)*ux_noise_scale)
-    random_idxs = torch.randperm(X.shape[0])[:noise_sample_size]
-    noise_sample = X[random_idxs,:] + ux_noise.sample(sample_shape=(noise_sample_size,))
-    noise_sample_proj = pca.transform(noise_sample.detach().cpu().numpy())
-    noise_ux = celldelta.ux(noise_sample)
-    noise_sample_drifts = noise_sample + noise_ux
-    noise_sample_drifts_proj = pca.transform(noise_sample_drifts.detach().cpu().numpy())
-    for i in range(noise_sample_size):
-        axs[0].arrow(noise_sample_proj[i,0], noise_sample_proj[i,1],
-                (noise_sample_drifts_proj[i,0] - noise_sample_proj[i,0])*arrow_scale,
-                (noise_sample_drifts_proj[i,1] - noise_sample_proj[i,1])*arrow_scale,
-                color='blue', alpha=.5, width=.002)
+
 axs[1].scatter(x_proj[:,0], x_proj[:,1], c=tonp((ux**2).sum(1)), cmap='viridis',s=4)
 axs[1].set_title('magnitude ux')
 # Add a colorbar of the cmap from axs[1]
@@ -703,7 +683,7 @@ if scatter:
 X.requires_grad = True
 celldelta = celldelta.eval()
 dq_dx, dq_dt = celldelta.pxt.dx_dt(X, ts)
-ux, du_dx = celldelta.ux.div(X)
+ux, du_dx = celldelta.phi.u.div(X)
 d_dx = ((dq_dx * ux).sum(dim=2) + du_dx)[...,None]
 X.requires_grad = False
 #%%0
@@ -760,10 +740,6 @@ for i in range(5):
     plt.colorbar(axs[i].collections[0], ax=axs[i])
 plt.tight_layout()
 
-#%%
-plt.scatter(x_proj[:,0], x_proj[:,1], c=tonp(du_dx), cmap='viridis',s=1)
-plt.title('div_ux')
-plt.colorbar()
 
 #%%
 fig, axs = plt.subplots(1,2, figsize=(15,7))
@@ -806,7 +782,7 @@ x = X.clone()
 x.requires_grad = True
 ts.requires_grad = True
 dq_dx, dq_dt = celldelta.pxt.dx_dt(x, ts)
-u = celldelta.ux.model(x)
+u = celldelta.phi.u.model(x)
 div_ux = torch.zeros_like(x[:,0])
 for i in range(u.shape[1]):
     div_ux += torch.autograd.grad(u[:,i], x, 
@@ -825,7 +801,7 @@ ts.requires_grad = False
 l_fp.backward()
 
 # Access and print gradients
-for name, param in celldelta.ux.model.named_parameters():
+for name, param in celldelta.phi.u.model.named_parameters():
     if param.requires_grad:
         print(name, param.grad.mean().item(), param.grad.std().item(), 
               param.mean().item(), param.std().item())
