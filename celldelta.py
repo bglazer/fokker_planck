@@ -7,48 +7,81 @@ from torch.autograd import grad
 # p(x,t): same as yours, small tweak in dx_dt
 # -----------------------------
 
-class Pxt(nn.Module):
-    def __init__(self, input_dim, hidden_dim, n_layers):
-        super().__init__()
-        layers = []
-        layers.append(nn.Linear(input_dim + 1, hidden_dim, bias=True))
-        layers.append(nn.LeakyReLU())
-        for _ in range(n_layers - 1):
-            layers.append(nn.Linear(hidden_dim, hidden_dim, bias=True))
-            layers.append(nn.LeakyReLU())
-        layers.append(nn.Linear(hidden_dim, 1, bias=True))
-        self.layers = nn.ModuleList(layers)
-        self.model  = nn.Sequential(*layers)
 
-        # Optional time scaling (kept from your code, but off by default)
+class TimeFeat(nn.Module):
+    """Bounded time encoder: tanh(t) plus K Fourier features sin/cos(k·2πt).
+    Keeps ∂/∂t bounded while giving expressive time signal.
+    Assumes t is in a reasonable numeric range (e.g., [0,1] or seconds scaled);
+    sin/cos remain bounded regardless.
+    """
+    def __init__(self, K: int = 4):
+        super().__init__()
+        omega = 2 * torch.pi * torch.arange(1, K + 1, dtype=torch.float32)
+        self.register_buffer('omega', omega)
+        self.K = K
+
+    def forward(self, t):
+        # t: (...,) or (...,1)
+        t = t.view(-1)                                   # (N,)
+        s = torch.sin(torch.outer(t, self.omega))        # (N, K)
+        c = torch.cos(torch.outer(t, self.omega))        # (N, K)
+        t_b = torch.tanh(t).unsqueeze(-1)                # (N, 1) bounded linear-ish feature
+        return torch.cat([t_b, s, c], dim=-1)            # (N, 1+2K)
+
+
+class Pxt(nn.Module):
+    def __init__(self, input_dim, hidden_dim, n_layers, time_K: int = 4):
+        super().__init__()
+        # Bounded time encoder and separate projections for x and t-features
+        self.time_enc = TimeFeat(K=time_K)
+        self.x_proj   = nn.Linear(input_dim, hidden_dim, bias=True)
+        # FiLM-style time modulation: maps time features -> [gamma, beta]
+        self.t_to_gb  = nn.Linear(1 + 2*time_K, 2*hidden_dim, bias=True)
+        # Initialize so that gamma≈1, beta≈0 at start (time has no effect initially)
+        with torch.no_grad():
+            nn.init.zeros_(self.t_to_gb.weight)
+            self.t_to_gb.bias[:hidden_dim].fill_(1.0)
+            self.t_to_gb.bias[hidden_dim:].zero_()
+
+        # Hidden trunk
+        h = []
+        for _ in range(max(0, n_layers - 1)):
+            h += [nn.LeakyReLU(), nn.Linear(hidden_dim, hidden_dim, bias=True)]
+        self.trunk = nn.Sequential(*h)
+        self.out   = nn.Linear(hidden_dim, 1, bias=True)
+
+        # Legacy attribute kept for API compatibility; not used anymore for time scaling
         self.tscale = nn.Parameter(torch.ones(input_dim + 1), requires_grad=False)
 
     def xts(self, x, ts):
         # x: (B, D), ts: (T,)
-        xs  = x.repeat((ts.shape[0], 1, 1))           # (T, B, D)
-        ts_ = ts.repeat((x.shape[0], 1)).T.unsqueeze(2)  # (T, B, 1)
-        return torch.cat((xs, ts_), dim=2)            # (T, B, D+1)
+        xs  = x.repeat((ts.shape[0], 1, 1))                 # (T, B, D)
+        ts_ = ts.repeat((x.shape[0], 1)).T.unsqueeze(2)     # (T, B, 1)
+        return torch.cat((xs, ts_), dim=2)                  # (T, B, D+1)
 
     def forward(self, xts):
-        # xts: (T, B, D+1)
+        # xts: (T, B, D+1) with last channel the *raw* t
         s = xts.shape
-        x = xts.reshape(-1, xts.shape[-1])            # (T*B, D+1)
-        # first layer with optional scaling on inputs
-        layer0 = self.layers[0]
-        x = (x * self.tscale) @ layer0.weight.T + layer0.bias
-        for layer in self.layers[1:]:
-            x = layer(x)
-        x = x.reshape(s[:-1] + (-1,))                 # (T, B, 1)
-        return x
+        xb = xts.reshape(-1, xts.shape[-1])                 # (T*B, D+1)
+        x_in, t_in = xb[:, :-1], xb[:, -1]                  # (T*B, D), (T*B,)
+        # Encode time with bounded features (autograd handles chain rule)
+        t_feat = self.time_enc(t_in)                        # (T*B, 1+2K)
+        gb = self.t_to_gb(t_feat)                           # (T*B, 2H)
+        H = self.out.in_features
+        gamma_raw, beta = torch.split(gb, H, dim=-1)        # (T*B,H), (T*B,H)
+        gamma = 1.0 + 0.1 * torch.tanh(gamma_raw)           # bounded, ≈1 initially
+        h_x = self.x_proj(x_in)                             # (T*B, H)
+        h = gamma * h_x + beta                              # FiLM modulation
+        h = self.trunk(h)
+        y = self.out(h)                                     # (T*B, 1)
+        return y.reshape(s[:-1] + (-1,))                    # (T, B, 1)
+
 
     def log_pxt(self, x, ts):
         return self.forward(self.xts(x, ts))
 
     def pxt(self, x, ts):
         return torch.exp(self.log_pxt(x, ts))
-
-    def set_tscale(self, tscale):
-        self.tscale.data[-1] = tscale
 
     def log_px(self, x, ts):
         return torch.logsumexp(self.log_pxt(x, ts), dim=0)
@@ -57,23 +90,15 @@ class Pxt(nn.Module):
         """
         Returns:
           dq_dx: (T, B, D)
-          dq_dt: (T, B, 1)  # physical time derivative
+          dq_dt: (T, B, 1)  # derivative w.r.t. *raw* t (bounded features handle chain rule)
         """
         xts = self.xts(x, ts)
         xts.requires_grad_(True)
-        q = self.forward(xts)                          # (T, B, 1)
+        q = self.forward(xts)                                # (T, B, 1)
         g = grad(q, xts, grad_outputs=torch.ones_like(q),
-                 create_graph=True, retain_graph=True)[0]    # (T, B, D+1)
-        dq_dx = g[..., :-1]
-        dq_dt_internal = g[..., -1:]                       # derivative w.r.t. raw input t
-        # Chain-rule correction if time was scaled inside forward by a gain s_t:
-        # if forward used t_scaled = s_t * t, then autograd gives dq/dt = (dq/dt_scaled) * s_t.
-        # To recover dq/dt_scaled (or to unscale an exaggerated magnitude), divide by s_t.
-        s_t = None
-        # last entry is the time channel scale
-        s_t = self.tscale[-1]
-        dq_dt = dq_dt_internal / s_t
-        return dq_dx, dq_dt
+                 create_graph=True, retain_graph=True)[0]     # (T, B, D+1)
+        return g[..., :-1], g[..., -1:]
+
 
 # -----------------------------
 # Potential flow: u = ∇_x φ(x,t), div u = Δ_x φ
@@ -83,7 +108,7 @@ class Phi(nn.Module):
     """
     Scalar potential φ(x). Drift u = ∇_x φ, divergence = Δ_x φ.
     """
-    def __init__(self, input_dim, hidden_dim, n_layers, batch_norm=False):
+    def __init__(self, input_dim, hidden_dim, n_layers):
         super().__init__()
         layers = []
 
@@ -144,6 +169,7 @@ class CellDelta(nn.Module):
     def __init__(self, input_dim, 
                  ux_hidden_dim, ux_layers,
                  pxt_hidden_dim, pxt_layers,
+                 pxt_time_k=4,
                  device='cpu') -> None:
         """
         Initialize the CellDelta model with the given hyperparameters.
@@ -162,8 +188,8 @@ class CellDelta(nn.Module):
         """
         super().__init__()
         # self.phi = Ux(input_dim, ux_hidden_dim, ux_layers, ux_batch_norm).to(device)
-        self.phi = Phi(input_dim, ux_hidden_dim, ux_layers, batch_norm=False).to(device)
-        self.pxt = Pxt(input_dim, pxt_hidden_dim, pxt_layers).to(device)
+        self.phi = Phi(input_dim, ux_hidden_dim, ux_layers).to(device)
+        self.pxt = Pxt(input_dim, pxt_hidden_dim, pxt_layers, time_K=pxt_time_k).to(device)
         self.device = device
         # Add the component models (ux, pxt, nce) to a module list
         self.models = torch.nn.ModuleDict({'phi':self.phi, 'pxt':self.pxt})

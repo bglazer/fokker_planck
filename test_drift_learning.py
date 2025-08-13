@@ -117,16 +117,16 @@ losses = celldelta.optimize(X=X,
                             p0_alpha=p0_alpha, 
                             verbose=True)
 
-#%%
-# Optimize the Fokker-Planck term
-fokker_planck_alpha = 1000
-_ = celldelta.optimize_fokker_planck(X, ts,
-                                     ux_lr=1e-4,
-                                     fokker_planck_alpha=fokker_planck_alpha,
-                                     noise=None,
-                                     n_epochs=1000, 
-                                     n_samples=n_samples,
-                                     verbose=True)
+# #%%
+# # Optimize the Fokker-Planck term
+# fokker_planck_alpha = 1000
+# _ = celldelta.optimize_fokker_planck(X, ts,
+#                                      ux_lr=1e-4,
+#                                      fokker_planck_alpha=fokker_planck_alpha,
+#                                      noise=None,
+#                                      n_epochs=1000, 
+#                                      n_samples=n_samples,
+#                                      verbose=True)
 
 
 # %%
@@ -410,7 +410,6 @@ device = 'cuda:0'
 N = 103
 tsteps = 100
 d = 5
-tscale = 10
 ts = torch.linspace(0, 1, tsteps, device=device)
 ts_np = ts.cpu().detach().numpy()
 X = torch.randn((N, d, tsteps), device=device)
@@ -424,7 +423,6 @@ X_t = X + v
 # Change X_t to shape (N, tsteps, d)
 X_t = X_t.permute(0, 2, 1)
 # Flatten X_t to shape (N*tsteps, d)
-xscale = 1
 X = X_t.reshape((N*tsteps, d))
 # X = (X-X.mean())/X.std()
 X0_mask = torch.zeros((N,tsteps), dtype=bool)
@@ -438,7 +436,8 @@ x_proj = pca.fit_transform(X.cpu().numpy())
 # Initialize the model
 celldelta = CellDelta(input_dim=d, device=device,
                       ux_hidden_dim=64, ux_layers=0, 
-                      pxt_hidden_dim=64, pxt_layers=2)
+                      pxt_hidden_dim=64, pxt_layers=2,
+                      pxt_time_k=d)
 
 mean = X.mean(dim=0, keepdim=False)
 cov = np.cov(X.cpu().numpy().T)
@@ -452,26 +451,15 @@ cov0 = torch.tensor(cov0, dtype=torch.float32).to(device)
 noise0 = D.MultivariateNormal(mean0, cov0)
 
 #%%
-# Train the model
-# celldelta.pxt.set_tscale(0)
-losses = celldelta.optimize_initial_conditions(X0, ts, p0_noise=noise0, 
-                                               scale=1, #/ts.shape[0],
-                                               pxt_lr=1e-3,
-                                               n_epochs=1000, 
-                                               verbose=True)
-
-#%%
 start = time.time()
 n_epochs = 1000
 n_samples = 1000
 p_alpha = 1
 p0_alpha = 1
 fokker_planck_alpha = None
-l_consistency_alpha = .001
+l_consistency_alpha = 1
 ux_lr  = 1e-4
 pxt_lr = 1e-4
-
-celldelta.pxt.set_tscale(100)
 
 losses = celldelta.optimize(X=X, 
                             X0=X0, 
@@ -491,45 +479,14 @@ losses = celldelta.optimize(X=X,
 end = time.time()
 print(f'Time elapsed: {end-start:.2f}s')
 
-#%%
-start = time.time()
-n_epochs = 1000
-n_samples = 1000
-p_alpha = 1
-p0_alpha = 1
-fokker_planck_alpha = 10
-l_consistency_alpha = .001
-ux_lr  = 1e-4
-pxt_lr = 1e-4
-
-celldelta.pxt.set_tscale(100)
-
-losses = celldelta.optimize(X=X, 
-                            X0=X0, 
-                            ts=ts, 
-                            pxt_lr=pxt_lr, 
-                            ux_lr=ux_lr,
-                            n_epochs=n_epochs, 
-                            n_samples=n_samples, 
-                            p0_noise=noise0,
-                            px_noise=noise, 
-                            fokker_planck_alpha=fokker_planck_alpha,
-                            p0_alpha=p0_alpha, 
-                            p_alpha=p_alpha,
-                            l_consistency_alpha=l_consistency_alpha,
-                            verbose=True)
-
-end = time.time()
-print(f'Time elapsed: {end-start:.2f}s')
-
-#%%
-_=celldelta.optimize_fokker_planck(X, ts,
-                                   ux_lr=ux_lr,
-                                   fokker_planck_alpha=fokker_planck_alpha,
-                                   noise=None,
-                                   n_epochs=500, 
-                                   n_samples=1e8,
-                                   verbose=True)
+# #%%
+# _=celldelta.optimize_fokker_planck(X, ts,
+#                                    ux_lr=ux_lr,
+#                                    fokker_planck_alpha=fokker_planck_alpha
+#                                    noise=None,
+#                                    n_epochs=500, 
+#                                    n_samples=1e8,
+#                                    verbose=True)
 
 # %%
 celldelta = celldelta.eval()
@@ -577,15 +534,15 @@ axs[2].axvline(pct95, c='red', linestyle='--', linewidth=1)
 axs[2].text(pct95+abs_diffs.max()/100, 0, f'95th pct={pct95:d}')
 axs[2].set_title('Empirical CDF of absolute differences of estimated versus true pseudotime')
 
-#%%
-# Plot the scalar field at each point
-fig, axs = plt.subplots(1,1, figsize=(8,4)) 
-phi = tonp(celldelta.phi(X))
-axs.scatter(x_proj[:,0], x_proj[:,1], c=phi, cmap=viridis, s=1)
-plt.colorbar(axs.collections[0], ax=axs)
-axs.set_title('Scalar field $\phi(x)$')
-axs.set_xticks([])
-axs.set_yticks([]);
+# #%%
+# # Plot the scalar field at each point
+# fig, axs = plt.subplots(1,1, figsize=(8,4)) 
+# phi = tonp(celldelta.phi(X))
+# axs.scatter(x_proj[:,0], x_proj[:,1], c=phi, cmap=viridis, s=1)
+# plt.colorbar(axs.collections[0], ax=axs)
+# axs.set_title('Scalar field $\phi(x)$')
+# axs.set_xticks([])
+# axs.set_yticks([]);
 
 #%%
 # Plot the predicted p(x,t) for each cell at each timestep t
@@ -667,7 +624,7 @@ axs[0].set_title('magnitude ux')
 plt.colorbar(axs[0].collections[0], ax=axs[0])
 # Bar chart of ux mean magnitude
 axs[1].bar(np.arange(ux.shape[1]), tonp((ux).mean(0)))
-#%%
+    #%%
 # Simulate the stochastic differential equation using the Euler-Maruyama method
 # with the learned drift term u(x)
 x0 = X_t[:,0,:].clone().detach()
