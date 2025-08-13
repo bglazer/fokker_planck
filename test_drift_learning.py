@@ -437,7 +437,7 @@ x_proj = pca.fit_transform(X.cpu().numpy())
 # %%
 # Initialize the model
 celldelta = CellDelta(input_dim=d, device=device,
-                      ux_hidden_dim=64, ux_layers=0, 
+                      ux_hidden_dim=5, ux_layers=0, 
                       pxt_hidden_dim=64, pxt_layers=2)
 
 mean = X.mean(dim=0, keepdim=False)
@@ -455,19 +455,22 @@ noise0 = D.MultivariateNormal(mean0, cov0)
 # Train the model
 # celldelta.pxt.set_tscale(0)
 losses = celldelta.optimize_initial_conditions(X0, ts, p0_noise=noise0, 
-                                               scale=1, #/ts.shape[0],
+                                               scale=1, #ts.shape[0],
                                                pxt_lr=1e-3,
                                                n_epochs=1000, 
                                                verbose=True)
 
 #%%
 start = time.time()
-n_epochs = 1000
+n_epochs = 2000
 n_samples = 1000
 p_alpha = 1
 p0_alpha = 1
-fokker_planck_alpha = None
-l_consistency_alpha = .001
+fokker_planck_alpha = 1
+time_prior_kl_alpha = None
+consistency_alpha = .001
+div_penalty_alpha = None
+
 ux_lr  = 1e-4
 pxt_lr = 1e-4
 
@@ -485,44 +488,17 @@ losses = celldelta.optimize(X=X,
                             fokker_planck_alpha=fokker_planck_alpha,
                             p0_alpha=p0_alpha, 
                             p_alpha=p_alpha,
-                            l_consistency_alpha=l_consistency_alpha,
+                            time_prior_kl_alpha=time_prior_kl_alpha,
+                            consistency_alpha=consistency_alpha,
+                            div_penalty_alpha=div_penalty_alpha,
                             verbose=True)
 
 end = time.time()
 print(f'Time elapsed: {end-start:.2f}s')
 
-#%%
-start = time.time()
-n_epochs = 1000
-n_samples = 1000
-p_alpha = 1
-p0_alpha = 1
-fokker_planck_alpha = 10
-l_consistency_alpha = .001
-ux_lr  = 1e-4
-pxt_lr = 1e-4
-
-celldelta.pxt.set_tscale(100)
-
-losses = celldelta.optimize(X=X, 
-                            X0=X0, 
-                            ts=ts, 
-                            pxt_lr=pxt_lr, 
-                            ux_lr=ux_lr,
-                            n_epochs=n_epochs, 
-                            n_samples=n_samples, 
-                            p0_noise=noise0,
-                            px_noise=noise, 
-                            fokker_planck_alpha=fokker_planck_alpha,
-                            p0_alpha=p0_alpha, 
-                            p_alpha=p_alpha,
-                            l_consistency_alpha=l_consistency_alpha,
-                            verbose=True)
-
-end = time.time()
-print(f'Time elapsed: {end-start:.2f}s')
-
-#%%
+    #%%
+ux_lr = 1e-3
+fokker_planck_alpha = 1
 _=celldelta.optimize_fokker_planck(X, ts,
                                    ux_lr=ux_lr,
                                    fokker_planck_alpha=fokker_planck_alpha,
@@ -577,15 +553,6 @@ axs[2].axvline(pct95, c='red', linestyle='--', linewidth=1)
 axs[2].text(pct95+abs_diffs.max()/100, 0, f'95th pct={pct95:d}')
 axs[2].set_title('Empirical CDF of absolute differences of estimated versus true pseudotime')
 
-#%%
-# Plot the scalar field at each point
-fig, axs = plt.subplots(1,1, figsize=(8,4)) 
-phi = tonp(celldelta.phi(X))
-axs.scatter(x_proj[:,0], x_proj[:,1], c=phi, cmap=viridis, s=1)
-plt.colorbar(axs.collections[0], ax=axs)
-axs.set_title('Scalar field $\phi(x)$')
-axs.set_xticks([])
-axs.set_yticks([]);
 
 #%%
 # Plot the predicted p(x,t) for each cell at each timestep t
@@ -614,7 +581,15 @@ plt.tight_layout()
 # plt.scatter(x_proj[:,0], x_proj[:,1], c=pxts[:,0], cmap=viridis, s=1)
 # plt.scatter(x_proj_n1[:,0], x_proj_n1[:,1], c=pxtn1[:,0], cmap=viridis, s=10, marker='x')
 # plt.colorbar()
-
+#%%
+# Plot the scalar field at each point
+fig, axs = plt.subplots(1,1, figsize=(8,4)) 
+phi = tonp(celldelta.phi(X))
+axs.scatter(x_proj[:,0], x_proj[:,1], c=phi, cmap=viridis, s=1)
+plt.colorbar(axs.collections[0], ax=axs)
+axs.set_title('Scalar field $\phi(x)$')
+axs.set_xticks([])
+axs.set_yticks([]);
 #%%
 plt.plot(pxts.mean(axis=0), marker='o', markersize=2, c='blue')
 plt.ylabel('mean p(x,t)', c='blue')
@@ -631,7 +606,7 @@ random_idxs = torch.randperm(X.shape[0])[:n_cells]
 random_cells = X[random_idxs,:]
 # Get the drift term u(x) for each cell
 ux = celldelta.phi.u(X)
-uxs = ux[random_idxs,:]
+uxs = ux[random_idxs,:]*tscale
 # Add the uxs to the random_cells
 random_drifts = random_cells + uxs
 # Project the random_cells and random_drifts onto the PCA components

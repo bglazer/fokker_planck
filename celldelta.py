@@ -12,10 +12,10 @@ class Pxt(nn.Module):
         super().__init__()
         layers = []
         layers.append(nn.Linear(input_dim + 1, hidden_dim, bias=True))
-        layers.append(nn.LeakyReLU())
+        layers.append(nn.SiLU())
         for _ in range(n_layers - 1):
             layers.append(nn.Linear(hidden_dim, hidden_dim, bias=True))
-            layers.append(nn.LeakyReLU())
+            layers.append(nn.SiLU())
         layers.append(nn.Linear(hidden_dim, 1, bias=True))
         self.layers = nn.ModuleList(layers)
         self.model  = nn.Sequential(*layers)
@@ -83,16 +83,16 @@ class Phi(nn.Module):
     """
     Scalar potential φ(x). Drift u = ∇_x φ, divergence = Δ_x φ.
     """
-    def __init__(self, input_dim, hidden_dim, n_layers, batch_norm=False):
+    def __init__(self, input_dim, hidden_dim, n_layers):
         super().__init__()
         layers = []
 
         layers += [nn.Linear(input_dim, hidden_dim, bias=True)]
-        layers += [nn.LeakyReLU()]
+        layers += [nn.SiLU()]
 
         for _ in range(n_layers - 1):
             layers += [nn.Linear(hidden_dim, hidden_dim, bias=True)]
-            layers += [nn.LeakyReLU()]
+            layers += [nn.SiLU()]
 
         layers += [nn.Linear(hidden_dim, 1, bias=True)]   # scalar φ
         self.net = nn.Sequential(*layers)
@@ -162,7 +162,7 @@ class CellDelta(nn.Module):
         """
         super().__init__()
         # self.phi = Ux(input_dim, ux_hidden_dim, ux_layers, ux_batch_norm).to(device)
-        self.phi = Phi(input_dim, ux_hidden_dim, ux_layers, batch_norm=False).to(device)
+        self.phi = Phi(input_dim, ux_hidden_dim, ux_layers).to(device)
         self.pxt = Pxt(input_dim, pxt_hidden_dim, pxt_layers).to(device)
         self.device = device
         # Add the component models (ux, pxt, nce) to a module list
@@ -228,9 +228,31 @@ class CellDelta(nn.Module):
         l_cons = (log_pxt[1:].mean(1) - log_pxt[0].mean())**2
         return l_cons.mean()
 
+    def time_responsibilities(self, X, ts):
+        # log_pxt: (T,B,1) -> (T,B); softmax over T gives p(t|x) up to proportionality
+        logp = self.pxt.log_pxt(X, ts).squeeze(-1)          # (T,B)
+        w = torch.softmax(logp, dim=0)                      # sum_T w = 1 for each b
+        return w
+
+    def time_prior_kl(self, X, ts, prior="uniform"):
+        w = self.time_responsibilities(X, ts)               # (T,B), sum over T = 1
+        T = w.size(0)
+        if prior == "uniform":
+            logu = -np.log(T)
+            kl_b = (w * (torch.log(w + 1e-8) - logu)).sum(dim=0)  # (B,)
+        else:
+            raise NotImplementedError
+        return kl_b.mean()
+    
+    def divergence_penalty(self, x, lam=1e-2):
+        _, lap = self.phi.grad_and_laplacian(x)  # (B,1)
+        return lam * (lap**2).mean()
+
     def optimize(self, X, X0, ts, px_noise, p0_noise, p0_alpha=1,
                  pxt_lr=5e-4, ux_lr=1e-3, fokker_planck_alpha=1, 
-                 l_consistency_alpha=None,
+                 consistency_alpha=None,
+                 time_prior_kl_alpha=None,
+                 div_penalty_alpha=None,
                  p_alpha=None,
                  n_epochs=100, n_samples=1000, verbose=False):
         """
@@ -299,11 +321,23 @@ class CellDelta(nn.Module):
             else:
                 l_fp = zero
 
-            if l_consistency_alpha is not None:
-                l_cons = self.consistency_loss(x, ts)*l_consistency_alpha
+            if consistency_alpha is not None:
+                l_cons = self.consistency_loss(x, ts)*consistency_alpha
                 l_cons.backward()
             else:
                 l_cons = zero
+
+            if time_prior_kl_alpha is not None:
+                l_tpk = self.time_prior_kl(X, ts)*time_prior_kl_alpha
+                l_tpk.backward()
+            else:
+                l_tpk = zero
+
+            if div_penalty_alpha is not None:
+                l_div = self.divergence_penalty(x)*div_penalty_alpha
+                l_div.backward()
+            else:
+                l_div = zero
 
             self.pxt_optimizer.step()
             self.phi_optimizer.step()
@@ -318,11 +352,39 @@ class CellDelta(nn.Module):
                     f'acc_p0={float(acc_p0): .5f}, '
                     f'l_fp={float(l_fp):.5f}, '
                     f'l_cons={float(l_cons):.5f}, '
+                    f'l_tpk={float(l_tpk):.5f}, '
+                    f'l_div={float(l_div):.5f}'
                     )
-                
-        return {'l_nce_px': l_nce_pxs, 'l_nce_p0': l_nce_p0s, 'l_fp': l_fps}
+                if (epoch+1) % 50 == 0:
+                    # FP term stats
+                    fp = self.fp_terms(x, ts, lap_estimator="exact")
+                    print(f"[FP] {epoch} stats:", {k: round(v,5) for k,v in fp["stats"].items()})
+
+                    # Grad conflict stats (cheap if done occasionally)
+                    gc = self.grad_conflict(x, x0, ts, px_noise, p0_noise)
+                    print(f"[GRADS] {epoch}:", {k: round(v,5) for k,v in gc.items()})
+
+                    fpT = self.fp_per_time(x, ts)
+                    print("[FP/T]", {k: np.round(v, 4).tolist() for k,v in fpT.items()})
+
+                    vfit = self.eval_const_u_fit(x, ts)
+                    print("[CONST-U]", {k: round(v, 5) for k,v in vfit.items()})
+
+                    par = self.parallel_fraction(x, ts)
+                    print("[U‖]", {k: round(v, 5) for k,v in par.items()})
+
+                    # inside the verbose block, after the parallel_fraction print:
+                    tv_stats = self.time_variation_logp(x, ts)
+                    fd_stats = self.fp_density_residual(x, ts)
+                    div_stats = self.divergence_stats(x)
+                    print("[TV]", {k: round(v, 5) for k, v in tv_stats.items()})
+                    print("[FD]", {k: round(v, 5) for k, v in fd_stats.items()})
+                    print("[DIV]", {k: round(v, 5) for k, v in div_stats.items()})
+
+
+        return {'l_nce_px': l_nce_pxs, 'l_nce_p0': l_nce_p0s, 'l_fp': l_fps, 'l_tpk': l_tpk}
     
-    def optimize_fokker_planck(self, X, ts, 
+    def optimize_fokker_planck(self, X, ts,
                                ux_lr=1e-3, fokker_planck_alpha=1,
                                noise=None,
                                n_epochs=100, n_samples=1000, verbose=False):
@@ -429,3 +491,185 @@ class CellDelta(nn.Module):
                 x[x < 0] = 0.0
             xts[i,:,:] = x.cpu().detach()
         return xts
+    
+    def fp_terms(self, x, ts, lap_estimator="exact", n_probe=8):
+        """
+        Returns detached tensors of each FP term and summary stats.
+        """
+        with torch.enable_grad():
+            dq_dx, dq_dt = self.pxt.dx_dt(x, ts)               # (T,B,D), (T,B,1)
+            u, lap_exact = self.phi.grad_and_laplacian(x)      # (B,D), (B,1)
+
+            adv = (u * dq_dx).sum(dim=-1, keepdim=True)        # (T,B,1)
+            if lap_estimator == "exact":
+                divu = lap_exact.expand(dq_dt.shape)           # broadcast over T
+            elif lap_estimator == "zero":
+                # helpful to see what happens if Δφ effectively vanishes
+                divu = torch.zeros_like(dq_dt)
+            else:
+                raise ValueError("lap_estimator must be 'exact' or 'zero'")
+
+            residual = dq_dt + adv + divu                      # (T,B,1)
+
+        # Summaries across (T,B)
+        stats = {}
+        stats.update(_tensor_stats("dq_dt", dq_dt))
+        stats.update(_tensor_stats("adv",   adv))
+        stats.update(_tensor_stats("divu",  divu))
+        stats.update(_tensor_stats("res",   residual))
+
+        # How aligned is adv with -dq_dt? (For a translating Gaussian, this should be ~1)
+        with torch.no_grad():
+            a = adv.flatten()
+            b = (-dq_dt).flatten()
+            dot = float((a*b).mean())
+            corr = float(torch.corrcoef(torch.stack([a, b]))[0,1]) if a.numel() == b.numel() and a.numel() > 1 else float('nan')
+            stats.update({"adv_vs_neg_dqdt_dot": dot, "adv_vs_neg_dqdt_corr": corr})
+
+        return {"dq_dt": dq_dt.detach(), "adv": adv.detach(), "divu": divu.detach(),
+                "residual": residual.detach(), "stats": stats}
+    
+    def grad_conflict(self, x, x0, ts, px_noise, p0_noise):
+        # Compute NCE grads
+        self.pxt_optimizer.zero_grad()
+        self.phi_optimizer.zero_grad()
+        l_nce_px, _ = self.nce_loss(x,  px_noise, ts=ts,  scale=1/ts.shape[0])
+        l_nce_p0, _ = self.nce_loss(x0, p0_noise, ts=torch.zeros(1,device=x.device), scale=1)
+        lnce = l_nce_px + l_nce_p0
+        lnce.backward(retain_graph=True)
+        g_pxt_nce = _flat_grads(self.pxt)
+        g_phi_nce = _flat_grads(self.phi)
+
+        # Compute FP grads
+        self.pxt_optimizer.zero_grad()
+        self.phi_optimizer.zero_grad()
+        l_fp = self.fokker_planck_loss(x, ts)
+        l_fp.backward(retain_graph=True)
+        g_pxt_fp = _flat_grads(self.pxt)
+        g_phi_fp = _flat_grads(self.phi)
+
+        return {
+            "cos_pxt": _cosine(g_pxt_nce, g_pxt_fp),
+            "cos_phi": _cosine(g_phi_nce, g_phi_fp),
+            "||g_pxt_nce||": float(g_pxt_nce.norm()),
+            "||g_pxt_fp||":  float(g_pxt_fp .norm()),
+            "||g_phi_nce||": float(g_phi_nce.norm()),
+            "||g_phi_fp||":  float(g_phi_fp .norm()),
+        }
+    
+    def fp_per_time(self, x, ts):
+        dq_dx, dq_dt = self.pxt.dx_dt(x, ts)         # (T,B,D), (T,B,1)
+        u, lap = self.phi.grad_and_laplacian(x)      # (B,D), (B,1)
+        adv = (u * dq_dx).sum(-1, keepdim=True)      # (T,B,1)
+        divu = lap.expand_as(dq_dt)
+        res = dq_dt + adv + divu                     # (T,B,1)
+        with torch.no_grad():
+            return {
+                "res_mean_per_T": res.mean(1).flatten().cpu().numpy()[::10],
+                "res_abs_mean_per_T": res.abs().mean(1).flatten().cpu().numpy()[::10],
+                "dq_dt_abs_mean_per_T": dq_dt.abs().mean(1).flatten().cpu().numpy()[::10],
+                "adv_abs_mean_per_T": adv.abs().mean(1).flatten().cpu().numpy()[::10],
+                "divu_abs_mean_per_T": divu.abs().mean(1).flatten().cpu().numpy()[::10],
+            }
+        
+    def parallel_fraction(self, x, ts):
+        dq_dx, _ = self.pxt.dx_dt(x, ts)       # (T,B,D)
+        u, _ = self.phi.grad_and_laplacian(x)  # (B,D)
+        with torch.no_grad():
+            # project u onto dq_dx (per T,B), report mean fraction
+            T,B,D = dq_dx.shape
+            u_expanded = u.unsqueeze(0).expand(T,-1,-1)              # (T,B,D)
+            num = (u_expanded * dq_dx).sum(-1)                       # (T,B)
+            den = (u_expanded.norm(dim=-1) * dq_dx.norm(dim=-1) + 1e-8)
+            cos = (num / den).abs()                                  # |cos|
+        return {"u_parallel_frac_mean": float(cos.mean()),
+                "u_parallel_frac_p25": float(cos.quantile(0.25)),
+                "u_parallel_frac_p75": float(cos.quantile(0.75))}
+    
+    def eval_const_u_fit(self, x, ts):
+        # need autograd inside dx_dt to compute derivatives
+        dq_dx, dq_dt = self.pxt.dx_dt(x, ts)              # (T,B,D), (T,B,1)
+        # compute v_hat on detached copies (no graph needed for lstsq)
+        v_hat = torch.linalg.lstsq((-dq_dx.detach()).reshape(-1, dq_dx.shape[-1]),
+                                dq_dt.detach().reshape(-1, 1)).solution.squeeze(1)  # (D,)
+
+        # u and comparisons don't need to build higher-order grads here; detach for safety
+        u_pred, _ = self.phi.grad_and_laplacian(x)        # uses enable_grad internally
+        with torch.no_grad():
+            cos = torch.nn.functional.cosine_similarity(u_pred, v_hat, dim=-1).mean()
+            mse = ((u_pred - v_hat)**2).mean()
+            norm = v_hat.norm()
+        return {"cos_u_vhat": float(cos), "mse_u_vhat": float(mse), "v_hat_norm": float(norm)}
+
+    def time_variation_logp(self, X, ts):
+        logp = self.pxt.log_pxt(X, ts).squeeze(-1)  # (T,B)
+        var_t = logp.var(dim=0)                     # (B,)
+        return {"var_t_logp_mean": float(var_t.mean()),
+                "var_t_logp_p25":  float(var_t.quantile(0.25)),
+                "var_t_logp_p75":  float(var_t.quantile(0.75))}
+    
+    def fp_density_residual(self, X, ts):
+        dq_dx, dq_dt = self.pxt.dx_dt(X, ts)                 # (T,B,D),(T,B,1)
+        u, lap = self.phi.grad_and_laplacian(X)              # (B,D),(B,1)
+        adv = (u * dq_dx).sum(-1, keepdim=True)              # (T,B,1)
+        rlog = dq_dt + adv + lap.expand_as(dq_dt)            # (T,B,1)
+        p = torch.exp(self.pxt.log_pxt(X, ts))               # (T,B,1)
+        rden = p * rlog
+        return {"rlog_abs_mean": float(rlog.abs().mean()),
+                "rden_abs_mean": float(rden.abs().mean())}
+
+    def divergence_stats(self, X):
+        _, lap = self.phi.grad_and_laplacian(X)      # (B,1)
+        return {"div_abs_mean": float(lap.abs().mean()),
+                "div_p95": float(lap.abs().quantile(0.95))}
+
+# --- utilities you can add somewhere in your file ---
+
+def estimate_v_const(dq_dx, dq_dt):
+    # dq_dx: (T,B,D), dq_dt: (T,B,1)
+    T,B,D = dq_dx.shape
+    A = (-dq_dx).reshape(T*B, D)
+    b = dq_dt.reshape(T*B, 1)
+    # lstsq handles rank deficiency; returns (D,1)
+    v_hat = torch.linalg.lstsq(A, b).solution.squeeze(1)   # (D,)
+    return v_hat
+
+def _tensor_stats(name, t):
+    # returns compact stats for logging
+    with torch.no_grad():
+        return {
+            f'{name}_mean': float(t.mean()),
+            f'{name}_std':  float(t.std()),
+            f'{name}_abs_mean': float(t.abs().mean()),
+            f'{name}_p95': float(t.abs().quantile(0.95)),
+        }
+
+def _grad_norm(module):
+    total = 0.0
+    for p in module.parameters():
+        if p.grad is not None:
+            total += p.grad.detach().pow(2).sum().item()
+    return (total ** 0.5)
+
+def _flat_grads(module):
+    """Concatenate grads for all params; use zeros for missing grads so length is stable."""
+    vecs = []
+    for p in module.parameters():
+        if p.grad is None:
+            vecs.append(torch.zeros_like(p).reshape(-1))
+        else:
+            vecs.append(p.grad.detach().reshape(-1))
+    if not vecs:  # module with no params
+        return torch.zeros(1)
+    return torch.cat(vecs)
+
+def _cosine(a, b, eps=1e-12):
+    """Cosine similarity that’s tolerant of tiny norms."""
+    # (Lengths should now match; keep a guard anyway.)
+    if a.numel() != b.numel():
+        m = min(a.numel(), b.numel())
+        a, b = a[:m], b[:m]
+    an, bn = a.norm(), b.norm()
+    if an < eps or bn < eps:
+        return 0.0
+    return float((a @ b) / (an * bn + eps))
