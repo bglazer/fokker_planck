@@ -57,14 +57,23 @@ class Pxt(nn.Module):
         """
         Returns:
           dq_dx: (T, B, D)
-          dq_dt: (T, B, 1)
+          dq_dt: (T, B, 1)  # physical time derivative
         """
         xts = self.xts(x, ts)
         xts.requires_grad_(True)
         q = self.forward(xts)                          # (T, B, 1)
         g = grad(q, xts, grad_outputs=torch.ones_like(q),
                  create_graph=True, retain_graph=True)[0]    # (T, B, D+1)
-        return g[..., :-1], g[..., -1:]               # (dq/dx, dq/dt)
+        dq_dx = g[..., :-1]
+        dq_dt_internal = g[..., -1:]                       # derivative w.r.t. raw input t
+        # Chain-rule correction if time was scaled inside forward by a gain s_t:
+        # if forward used t_scaled = s_t * t, then autograd gives dq/dt = (dq/dt_scaled) * s_t.
+        # To recover dq/dt_scaled (or to unscale an exaggerated magnitude), divide by s_t.
+        s_t = None
+        # last entry is the time channel scale
+        s_t = self.tscale[-1]
+        dq_dt = dq_dt_internal / s_t
+        return dq_dx, dq_dt
 
 # -----------------------------
 # Potential flow: u = ∇_x φ(x,t), div u = Δ_x φ
@@ -77,17 +86,12 @@ class Phi(nn.Module):
     def __init__(self, input_dim, hidden_dim, n_layers, batch_norm=False):
         super().__init__()
         layers = []
-        def maybe_bn(d): 
-            return [nn.BatchNorm1d(d, affine=True)] if batch_norm else []
 
-        layers += maybe_bn(input_dim + 1)
         layers += [nn.Linear(input_dim, hidden_dim, bias=True)]
-        layers += maybe_bn(hidden_dim)
         layers += [nn.LeakyReLU()]
 
         for _ in range(n_layers - 1):
             layers += [nn.Linear(hidden_dim, hidden_dim, bias=True)]
-            layers += maybe_bn(hidden_dim)
             layers += [nn.LeakyReLU()]
 
         layers += [nn.Linear(hidden_dim, 1, bias=True)]   # scalar φ

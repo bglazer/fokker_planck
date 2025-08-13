@@ -94,7 +94,7 @@ celldelta.train()
 pxt_lr = 1e-3
 losses = celldelta.optimize_initial_conditions(X0, ts, p0_noise=noise0, 
                                                n_epochs=500,
-                                               scale=1,#/ts.shape[0], 
+                                               scale=1, #/ts.shape[0], 
                                                verbose=True)
 #%%
 p_alpha = 1
@@ -136,6 +136,7 @@ high = float(X.max())
 l = low-.25*(high-low) 
 h = high+.25*(high-low)
 xs = torch.arange(l, h, .01, device=device)[:,None]
+phi = tonp(celldelta.phi(xs))
 
 celldelta.eval()
 pxts = np.exp(celldelta.pxt.log_pxt(xs, ts).squeeze().T.cpu().detach().numpy())
@@ -194,7 +195,14 @@ plt.twinx()
 plt.plot(pxts.sum(axis=0), marker='o', markersize=2, c='orange', label='sum p(x,t)')
 plt.ylabel('sum p(x,t)', c='orange')
 print(f'Min sum pxt {pxts.sum(axis=0).min():.2e} t={pxts.sum(0).argmin()}')
-print(f'Max sum pxt {pxts.sum(axis=0).min():.2e} t={pxts.sum(0).argmin()}')
+print(f'Max sum pxt {pxts.sum(axis=0).max():.2e} t={pxts.sum(0).argmax()}')
+
+#%%
+# Plot the phi scalar potential at each point
+plt.title('Phi scalar potential φ(x)')
+plt.plot(xs, phi)
+plt.xlabel('x')
+plt.ylabel('φ(x)')
 
 # %%
 # This plots the cumulative mean of p(x,t) at each timestep t, going from t=0 (left) to t=1 (right)
@@ -403,7 +411,7 @@ N = 103
 tsteps = 100
 d = 5
 tscale = 10
-ts = torch.linspace(0, 1, tsteps, device=device)*tscale
+ts = torch.linspace(0, 1, tsteps, device=device)
 ts_np = ts.cpu().detach().numpy()
 X = torch.randn((N, d, tsteps), device=device)
 # Create a sequence of steps to add to each timestep
@@ -416,8 +424,8 @@ X_t = X + v
 # Change X_t to shape (N, tsteps, d)
 X_t = X_t.permute(0, 2, 1)
 # Flatten X_t to shape (N*tsteps, d)
-xscale = 10
-X = X_t.reshape((N*tsteps, d))*xscale
+xscale = 1
+X = X_t.reshape((N*tsteps, d))
 # X = (X-X.mean())/X.std()
 X0_mask = torch.zeros((N,tsteps), dtype=bool)
 X0_mask[:,0] = True
@@ -447,17 +455,18 @@ noise0 = D.MultivariateNormal(mean0, cov0)
 # Train the model
 # celldelta.pxt.set_tscale(0)
 losses = celldelta.optimize_initial_conditions(X0, ts, p0_noise=noise0, 
-                                               scale=1,
+                                               scale=1, #/ts.shape[0],
                                                pxt_lr=1e-3,
                                                n_epochs=1000, 
                                                verbose=True)
 
 #%%
 start = time.time()
+n_epochs = 1000
 n_samples = 1000
 p_alpha = 1
 p0_alpha = 1
-fokker_planck_alpha = 1
+fokker_planck_alpha = None
 l_consistency_alpha = .001
 ux_lr  = 1e-4
 pxt_lr = 1e-4
@@ -469,7 +478,7 @@ losses = celldelta.optimize(X=X,
                             ts=ts, 
                             pxt_lr=pxt_lr, 
                             ux_lr=ux_lr,
-                            n_epochs=2500, 
+                            n_epochs=n_epochs, 
                             n_samples=n_samples, 
                             p0_noise=noise0,
                             px_noise=noise, 
@@ -481,10 +490,39 @@ losses = celldelta.optimize(X=X,
 
 end = time.time()
 print(f'Time elapsed: {end-start:.2f}s')
-#%%
-fokker_planck_alpha = 1
-ux_lr = 1e-2
 
+#%%
+start = time.time()
+n_epochs = 1000
+n_samples = 1000
+p_alpha = 1
+p0_alpha = 1
+fokker_planck_alpha = 10
+l_consistency_alpha = .001
+ux_lr  = 1e-4
+pxt_lr = 1e-4
+
+celldelta.pxt.set_tscale(100)
+
+losses = celldelta.optimize(X=X, 
+                            X0=X0, 
+                            ts=ts, 
+                            pxt_lr=pxt_lr, 
+                            ux_lr=ux_lr,
+                            n_epochs=n_epochs, 
+                            n_samples=n_samples, 
+                            p0_noise=noise0,
+                            px_noise=noise, 
+                            fokker_planck_alpha=fokker_planck_alpha,
+                            p0_alpha=p0_alpha, 
+                            p_alpha=p_alpha,
+                            l_consistency_alpha=l_consistency_alpha,
+                            verbose=True)
+
+end = time.time()
+print(f'Time elapsed: {end-start:.2f}s')
+
+#%%
 _=celldelta.optimize_fokker_planck(X, ts,
                                    ux_lr=ux_lr,
                                    fokker_planck_alpha=fokker_planck_alpha,
@@ -492,20 +530,6 @@ _=celldelta.optimize_fokker_planck(X, ts,
                                    n_epochs=500, 
                                    n_samples=1e8,
                                    verbose=True)
-
-
-# # %%
-# fokker_planck_alpha = 1
-# for fp_noise_scale in np.linspace(0.01, 10, 10):
-#     losses = celldelta.optimize_fokker_planck(X, ts,
-#                                               ux_lr=1e-4,
-#                                               fokker_planck_alpha=fokker_planck_alpha,
-#                                               noise=fp_noise_scale,
-#                                               n_epochs=1000, 
-#                                               n_samples=n_samples,
-#                                               verbose=True)
-# plt.plot(losses['l_fp'], label='l_fp')
-# plt.plot(losses['l_fp0'], label='l_fp0')
 
 # %%
 celldelta = celldelta.eval()
@@ -539,8 +563,8 @@ diffs = np.sort(diffs)
 axs[1].hist(diffs, bins=np.arange(diffs.min(),diffs.max()))
 axs[1].set_title('Count of differences of estimated versus true pseudotime')
 # Set the ticks of the x-axis to be in the middle of the bins
-axs[1].set_xticks(np.arange(diffs.min(),diffs.max())+0.5, 
-                  labels=np.arange(diffs.min(),diffs.max()), rotation=90)
+axs[1].set_xticks(np.arange(diffs.min(),diffs.max(), 10)+0.5, 
+                  labels=np.arange(diffs.min(),diffs.max(), 10), rotation=90)
 
 # Make a empirical cumulative distribution of the differences
 abs_diffs = np.sort(np.abs(diffs))
@@ -555,13 +579,13 @@ axs[2].set_title('Empirical CDF of absolute differences of estimated versus true
 
 #%%
 # Plot the scalar field at each point
-fig, axs = plt.subplots(1,1, figsize=(10,8)) 
+fig, axs = plt.subplots(1,1, figsize=(8,4)) 
 phi = tonp(celldelta.phi(X))
 axs.scatter(x_proj[:,0], x_proj[:,1], c=phi, cmap=viridis, s=1)
 plt.colorbar(axs.collections[0], ax=axs)
 axs.set_title('Scalar field $\phi(x)$')
 axs.set_xticks([])
-axs.set_yticks([])
+axs.set_yticks([]);
 
 #%%
 # Plot the predicted p(x,t) for each cell at each timestep t
@@ -608,7 +632,6 @@ random_cells = X[random_idxs,:]
 # Get the drift term u(x) for each cell
 ux = celldelta.phi.u(X)
 uxs = ux[random_idxs,:]
- 
 # Add the uxs to the random_cells
 random_drifts = random_cells + uxs
 # Project the random_cells and random_drifts onto the PCA components
@@ -638,15 +661,21 @@ plt.colorbar(axs[1].collections[0], ax=axs[1])
 # for i in range(ux.shape[1]):
 #     print(f'{(ux**2).mean(0)[i].item():.4f}')# %%
 #%%
+fig, axs = plt.subplots(1,2, figsize=(15,7))
+axs[0].scatter(x_proj[:,0], x_proj[:,1], c=tonp((ux.abs()).sum(1)), cmap='viridis',s=1)
+axs[0].set_title('magnitude ux')
+plt.colorbar(axs[0].collections[0], ax=axs[0])
+# Bar chart of ux mean magnitude
+axs[1].bar(np.arange(ux.shape[1]), tonp((ux).mean(0)))
+#%%
 # Simulate the stochastic differential equation using the Euler-Maruyama method
 # with the learned drift term u(x)
 x0 = X_t[:,0,:].clone().detach()
-x = x0*xscale
-
+x = x0
 zero_boundary = False
 max_t = 1
 sigma=0.0
-xts = celldelta.simulate(x, tsim=torch.linspace(0, max_t, 100, device=device)*tscale,
+xts = celldelta.simulate(x, tsim=torch.linspace(0, max_t*tscale, 100, device=device)*tscale,
                          zero_boundary=zero_boundary, sigma=sigma)
 
 #%%
@@ -667,6 +696,8 @@ for i in range(3):
         # axs[i,j].scatter(x0[:,0], x0[:,1], color='black', alpha=1, s=.5)
 plt.tight_layout()
 
+#%%
+print(xts[-1])
 # %%
 # Scatter plot of all the simulation trajectories
 scatter = True
@@ -688,10 +719,10 @@ d_dx = ((dq_dx * ux).sum(dim=2) + du_dx)[...,None]
 X.requires_grad = False
 #%%0
 x0n1 = X_t[:,:].reshape((-1,d)).clone().detach()
+pxt0 = celldelta.pxt.log_pxt(x0n1, ts).squeeze().T.cpu().detach().numpy()
 # append X0 to the end of the sequence
 # x0n1 = torch.cat((X0, x0n1), dim=0)
 x0_proj = pca.transform(x0n1.cpu().numpy())
-pxt0 = celldelta.pxt.log_pxt(x0n1, ts).squeeze().T.cpu().detach().numpy()
 n_cells = 60
 random_idxs = torch.randperm(x0n1.shape[0])[:n_cells]
 random_cells = x0n1[random_idxs,:]
@@ -739,15 +770,6 @@ for i in range(5):
     axs[i].scatter(x_proj[:,0], x_proj[:,1], c=fp_err, cmap='viridis',s=fp_err,alpha=fp_err/fp_err.max())
     plt.colorbar(axs[i].collections[0], ax=axs[i])
 plt.tight_layout()
-
-
-#%%
-fig, axs = plt.subplots(1,2, figsize=(15,7))
-axs[0].scatter(x_proj[:,0], x_proj[:,1], c=tonp((ux.abs()).sum(1)), cmap='viridis',s=1)
-axs[0].set_title('magnitude ux')
-plt.colorbar(axs[0].collections[0], ax=axs[0])
-# Bar chart of ux mean magnitude
-axs[1].bar(np.arange(ux.shape[1]), tonp((ux.abs()).mean(0)))
 
 
 #%%
