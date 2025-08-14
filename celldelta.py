@@ -248,13 +248,89 @@ class CellDelta(nn.Module):
         _, lap = self.phi.grad_and_laplacian(x)  # (B,1)
         return lam * (lap**2).mean()
 
+    def u_penalized_loss(
+        self,
+        X,
+        ts,
+        beta=1e-3,                 # kinetic-energy weight
+        gamma=0.0,                 # divergence penalty weight (set >0 to use)
+        temp=1.0,                  # responsibility softmax temperature
+        detach_pxt=True,           # freeze p(x,t) while fitting u
+        weight_div_by_p=True,      # weight div term by p as well
+    ):
+        """
+        Penalized U-step loss (density-weighted):
+            L_u = E_p[(u·∇q + ∂_t q)^2]  +  beta * E_p[||u||^2]  +  gamma * ||div u||^2
+
+        Shapes:
+            X: (B, D)
+            ts: (T,)
+        Notes:
+            - Uses responsibilities w(t|x) ∝ exp(log p(x,t)) to approximate E_p[·].
+            - If detach_pxt=True, gradients do NOT flow into Pxt (recommended).
+            - Here u(x) = ∇φ(x) (time-independent); it is broadcast over T.
+            - div u = Δφ, which we already compute in grad_and_laplacian.
+        """
+        T = ts.shape[0]
+        B = X.shape[0]
+
+        # --- responsibilities w(t|x) ~ p(x,t) / Z  (stabilized, mean-normalized) ---
+        log_pxt = self.pxt.log_pxt(X, ts)          # (T,B,1)
+        if detach_pxt:
+            log_pxt = log_pxt.detach()
+
+        q_over_T = log_pxt / temp
+        q_center = q_over_T - q_over_T.max(dim=0, keepdim=True).values
+        w = torch.exp(q_center)                    # (T,B,1), proportional to p^1/temp
+        w = w / (w.mean() + 1e-8)                  # keep average weight ≈ 1
+
+        # --- score and time derivative from Pxt (frozen during U-step) ---
+        dq_dx, dq_dt = self.pxt.dx_dt(X, ts)       # (T,B,D), (T,B,1)
+        if detach_pxt:
+            dq_dx = dq_dx.detach()
+            dq_dt = dq_dt.detach()
+
+        # --- u(x) and div u(x) = Δφ(x) ---
+        u_x, lap = self.phi.grad_and_laplacian(X)  # (B,D), (B,1)
+        u_T = u_x.unsqueeze(0).expand(T, B, -1)    # (T,B,D)
+
+        # --- continuity (advective) fit: E_p[(u·∇q + ∂_t q)^2] ---
+        adv_res = (u_T * dq_dx).sum(-1, keepdim=True) + dq_dt   # (T,B,1)
+        L_adv = (w * (adv_res ** 2)).mean()
+
+        # --- kinetic energy: beta * E_p[||u||^2] ---
+        u_sq = (u_x ** 2).sum(dim=-1, keepdim=True)             # (B,1)
+        u_sq_T = u_sq.unsqueeze(0).expand_as(w)                  # (T,B,1)
+        L_ke = beta * (w * u_sq_T).mean()
+
+        # --- divergence penalty: gamma * ||div u||^2 ---
+        if gamma and gamma > 0.0:
+            lap_T = lap.unsqueeze(0).expand_as(w)            # (T,B,1)
+            L_div = gamma * (w * (lap_T ** 2)).mean()
+        else:
+            L_div = torch.zeros((), device=X.device)
+
+        L_total = L_adv + L_ke + L_div
+
+        # Return components for logging
+        return {
+            'L_u': L_total,
+            'L_adv': L_adv,
+            'L_ke': L_ke,
+            'L_div': L_div,
+        }
+
+
     def optimize(self, X, X0, ts, px_noise, p0_noise, p0_alpha=1,
-                 pxt_lr=5e-4, ux_lr=1e-3, fokker_planck_alpha=1, 
+                 pxt_lr=5e-4, ux_lr=1e-3, 
+                 u_penalty_alpha=None,
+                 fokker_planck_alpha=1, 
                  consistency_alpha=None,
                  time_prior_kl_alpha=None,
                  div_penalty_alpha=None,
                  p_alpha=None,
-                 n_epochs=100, n_samples=1000, verbose=False):
+                 n_epochs=100, n_samples=1000, 
+                 verbose=False):
         """
         Optimize the cell delta model parameters using the provided training data.
 
@@ -321,6 +397,12 @@ class CellDelta(nn.Module):
             else:
                 l_fp = zero
 
+            if u_penalty_alpha is not None:
+                l_u_pen = self.u_penalized_loss(x, ts)*u_penalty_alpha
+                l_u_pen.backward()
+            else:
+                l_u_pen = zero
+
             if consistency_alpha is not None:
                 l_cons = self.consistency_loss(x, ts)*consistency_alpha
                 l_cons.backward()
@@ -351,6 +433,7 @@ class CellDelta(nn.Module):
                     f'l_nce_p0={float(l_nce_p0): .5f}, '
                     f'acc_p0={float(acc_p0): .5f}, '
                     f'l_fp={float(l_fp):.5f}, '
+                    f'l_u_pen={float(l_u_pen):.5f}, '
                     f'l_cons={float(l_cons):.5f}, '
                     f'l_tpk={float(l_tpk):.5f}, '
                     f'l_div={float(l_div):.5f}'
