@@ -108,7 +108,7 @@ class Phi(nn.Module):
         g = grad(y, x, grad_outputs=grad_outputs,
                  create_graph=True, retain_graph=True)[0]
         # x.requires_grad_(False)
-        return g
+        return g+1
     
     
     def grad_and_laplacian(self, x):
@@ -253,10 +253,9 @@ class CellDelta(nn.Module):
         X,
         ts,
         beta=1e-3,                 # kinetic-energy weight
-        gamma=0.0,                 # divergence penalty weight (set >0 to use)
+        gamma=1.0,                 # divergence penalty weight (set >0 to use)
         temp=1.0,                  # responsibility softmax temperature
         detach_pxt=True,           # freeze p(x,t) while fitting u
-        weight_div_by_p=True,      # weight div term by p as well
     ):
         """
         Penalized U-step loss (density-weighted):
@@ -295,8 +294,9 @@ class CellDelta(nn.Module):
         u_T = u_x.unsqueeze(0).expand(T, B, -1)    # (T,B,D)
 
         # --- continuity (advective) fit: E_p[(u·∇q + ∂_t q)^2] ---
-        adv_res = (u_T * dq_dx).sum(-1, keepdim=True) + dq_dt   # (T,B,1)
-        L_adv = (w * (adv_res ** 2)).mean()
+        adv = (u_T * dq_dx).sum(-1, keepdim=True) + dq_dt
+        g2  = (dq_dx ** 2).sum(-1, keepdim=True)
+        L_adv = (w * (adv ** 2) / (g2 + 1e-6)).mean()
 
         # --- kinetic energy: beta * E_p[||u||^2] ---
         u_sq = (u_x ** 2).sum(dim=-1, keepdim=True)             # (B,1)
@@ -398,10 +398,17 @@ class CellDelta(nn.Module):
                 l_fp = zero
 
             if u_penalty_alpha is not None:
-                l_u_pen = self.u_penalized_loss(x, ts)*u_penalty_alpha
+                losses = self.u_penalized_loss(x, ts)
+                l_u_pen   = losses['L_u'] * u_penalty_alpha
+                l_adv_pen = losses['L_adv'] * u_penalty_alpha
+                l_ke_pen  = losses['L_ke'] * u_penalty_alpha
+                l_div_pen = losses['L_div'] * u_penalty_alpha
                 l_u_pen.backward()
             else:
                 l_u_pen = zero
+                l_adv_pen = zero
+                l_ke_pen = zero
+                l_div_pen = zero
 
             if consistency_alpha is not None:
                 l_cons = self.consistency_loss(x, ts)*consistency_alpha
@@ -434,6 +441,9 @@ class CellDelta(nn.Module):
                     f'acc_p0={float(acc_p0): .5f}, '
                     f'l_fp={float(l_fp):.5f}, '
                     f'l_u_pen={float(l_u_pen):.5f}, '
+                    f'l_adv_pen={float(l_adv_pen):.5f}, '
+                    f'l_ke_pen={float(l_ke_pen):.5f}, '
+                    f'l_div_pen={float(l_div_pen):.5f}, '
                     f'l_cons={float(l_cons):.5f}, '
                     f'l_tpk={float(l_tpk):.5f}, '
                     f'l_div={float(l_div):.5f}'
@@ -467,55 +477,81 @@ class CellDelta(nn.Module):
 
         return {'l_nce_px': l_nce_pxs, 'l_nce_p0': l_nce_p0s, 'l_fp': l_fps, 'l_tpk': l_tpk}
     
-    def optimize_fokker_planck(self, X, ts,
-                               ux_lr=1e-3, fokker_planck_alpha=1,
-                               noise=None,
-                               n_epochs=100, n_samples=1000, verbose=False):
+    def optimize_u_penalized(self, X, ts,
+                            ux_lr=1e-3,
+                            beta=1e-3,               # kinetic-energy weight
+                            gamma=1e-3,               # divergence penalty (0 if using div-free u)
+                            temp=1.0,                # softmax temperature for responsibilities
+                            detach_pxt=True,         # freeze Pxt while fitting u
+                            noise=None,              # std of Gaussian jitter added to X (optional)
+                            n_epochs=100, n_samples=1000, verbose=False):
         """
-        Optimize the Fokker-Planck component of the loss independently of the NCE component.
+        Optimize u(x) (i.e., phi) using the penalized U-step loss with p(x,t) frozen.
+
+        Loss:
+            L_u = E_p[(u·∇q + ∂_t q)^2] + beta * E_p[||u||^2] + gamma * ||div u||^2
+
+        Notes:
+        - Uses responsibility-weighted expectations over t from current Pxt.
+        - If gamma=0 and u is not parameterized divergence-free, no divergence control is applied.
+        - Detach Pxt quantities so gradients do not flow into Pxt during this U-step.
         """
+        # Optimizer for phi/u only
         self.phi_optimizer = torch.optim.Adam(self.phi.parameters(), lr=ux_lr)
 
-        l_fps = np.zeros(n_epochs)
-        l_fp0s = np.zeros(n_epochs)
-        
+        # History
+        L_u_hist   = np.zeros(n_epochs, dtype=np.float64)
+        L_adv_hist = np.zeros(n_epochs, dtype=np.float64)
+        L_ke_hist  = np.zeros(n_epochs, dtype=np.float64)
+        L_div_hist = np.zeros(n_epochs, dtype=np.float64)
+
         n_samples = min(n_samples, len(X))
 
-        if noise is not None:
-            # Create a Gaussian distribution
-            normal = torch.distributions.Normal(loc=torch.zeros(n_samples,device=self.device), 
-                                                scale=torch.ones(n_samples,device=self.device)*noise)
-
         for epoch in range(n_epochs):
-            # Sample from the data distribution
-            rand_idxs = torch.randperm(len(X))[:n_samples]
+            # Sample minibatch
+            rand_idxs = torch.randperm(len(X), device=X.device)[:n_samples]
             x = X[rand_idxs].clone().detach()
-            if noise is not None:
-                # Add Gaussian noise to the data
-                x = x + normal.sample().unsqueeze(1)
 
-            self.pxt_optimizer.zero_grad()
-            self.phi_optimizer.zero_grad()
+            # Optional Gaussian jitter
+            if noise is not None and noise > 0:
+                x = x + torch.randn_like(x) * float(noise)
 
-            # Calculate the Fokker-Planck loss
-            l_fp = self.fokker_planck_loss(x, ts)*fokker_planck_alpha
-            l_fp.backward()
+            # Zero grads
+            self.phi_optimizer.zero_grad(set_to_none=True)
 
-            # Fokker-Planck loss at t=0
-            # l_fp0 = self.fokker_planck_loss(x, ts[:1])*fokker_planck_alpha
-            # l_fp0.backward()
-            l_fp0 = torch.zeros(1).to(self.device)
+            # Compute penalized U-step loss (p is frozen via detach flags)
+            losses = self.u_penalized_loss(
+                X=x, ts=ts,
+                beta=beta, gamma=gamma,
+                temp=temp,
+                detach_pxt=detach_pxt,
+            )
 
+            # Backprop only through phi/u
+            losses['L_u'].backward()
             self.phi_optimizer.step()
 
-            # Record the losses
-            l_fps[epoch] = float(l_fp.mean())
-            l_fp0s[epoch] = float(l_fp0.mean())
+            # Log
+            L_u_hist[epoch]   = float(losses['L_u'].detach())
+            L_adv_hist[epoch] = float(losses['L_adv'].detach())
+            L_ke_hist[epoch]  = float(losses['L_ke'].detach())
+            L_div_hist[epoch] = float(losses['L_div'].detach())
+
             
             if verbose:
-                print(f'{epoch} l_fp={float(l_fp):.5f}, l_fp0={float(l_fp0):.5f}')
-                
-        return {'l_fp': l_fps, 'l_fp0': l_fp0s}
+                print(f"{epoch:4d} "
+                    f"L_u={L_u_hist[epoch]:.6f} "
+                    f"L_adv={L_adv_hist[epoch]:.6f} "
+                    f"L_ke={L_ke_hist[epoch]:.6f} "
+                    f"L_div={L_div_hist[epoch]:.6f}")
+
+        return {
+            'L_u':   L_u_hist,
+            'L_adv': L_adv_hist,
+            'L_ke':  L_ke_hist,
+            'L_div': L_div_hist,
+        }
+
     
     def optimize_initial_conditions(self, X0, ts, p0_noise, pxt_lr=1e-3,
                                     n_epochs=100, verbose=False, scale=1):

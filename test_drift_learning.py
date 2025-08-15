@@ -103,12 +103,13 @@ noise0 = D.MultivariateNormal(mean0, cov0)
 model.train()
 pxt_lr = 1e-3
 losses = model.optimize_initial_conditions(
-    X0, ts, p0_noise=noise0, n_epochs=500, scale=1, verbose=True  # /ts.shape[0],
+    X0, ts, p0_noise=noise0, n_epochs=500, scale=1, verbose=True 
 )
 # %%
 p_alpha = 1
 fokker_planck_alpha = None
 u_penalty_alpha = 1
+consistency_alpha = 0.01
 p0_alpha = 1
 ux_lr = 1e-3
 pxt_lr = 1e-3
@@ -127,23 +128,9 @@ losses = model.optimize(
     fokker_planck_alpha=fokker_planck_alpha,
     u_penalty_alpha=u_penalty_alpha,
     p0_alpha=p0_alpha,
+    consistency_alpha=consistency_alpha,
     verbose=True,
 )
-
-# %%
-# Optimize the Fokker-Planck term
-fokker_planck_alpha = 1000
-_ = model.optimize_fokker_planck(
-    X,
-    ts,
-    ux_lr=1e-4,
-    fokker_planck_alpha=fokker_planck_alpha,
-    noise=None,
-    n_epochs=1000,
-    n_samples=n_samples,
-    verbose=True,
-)
-
 
 # %%
 # Calculate the u(x) and p(x,t) for each cell
@@ -443,7 +430,7 @@ fig.tight_layout()
 device = "cuda:0"
 N = 103
 tsteps = 100
-d = 5
+d = 50
 tscale = 10
 ts = torch.linspace(0, 1, tsteps, device=device)
 ts_np = ts.cpu().detach().numpy()
@@ -479,15 +466,19 @@ model = CellDelta(
     pxt_layers=2,
 )
 
-mean = X.mean(dim=0, keepdim=False)
-cov = np.cov(X.cpu().numpy().T)
-cov = cov + np.eye(d) * 1e-3
-cov = torch.tensor(cov, dtype=torch.float32).to(device)
+# Compute the noise distribution from X_t instead of X
+flat_X = X_t.reshape(-1, d)                # flatten over (N, tsteps)
+mean = flat_X.mean(dim=0)                  # shape (d,)
+cov = np.cov(flat_X.cpu().numpy().T)       # shape (d, d)
+cov += np.eye(d) * 1e-3
+cov = torch.tensor(cov, dtype=torch.float32, device=device)
 noise = D.MultivariateNormal(mean, cov)
-mean0 = X0.mean(dim=0, keepdim=False)
+
+# Compute the initial‐time noise from X0 as before
+mean0 = X0.mean(dim=0)
 cov0 = np.cov(X0.cpu().numpy().T)
-cov0 = cov0 + np.eye(d) * 1e-3
-cov0 = torch.tensor(cov0, dtype=torch.float32).to(device)
+cov0 += np.eye(d) * 1e-3
+cov0 = torch.tensor(cov0, dtype=torch.float32, device=device)
 noise0 = D.MultivariateNormal(mean0, cov0)
 
 # %%
@@ -507,11 +498,12 @@ losses = model.optimize_initial_conditions(
 start = time.time()
 n_epochs = 2000
 n_samples = 1000
-p_alpha = 1
+p_alpha = 10
 p0_alpha = 1
-fokker_planck_alpha = 1
+u_penalty_alpha = 1
+fokker_planck_alpha = None
 time_prior_kl_alpha = None
-consistency_alpha = 0.001
+consistency_alpha = .001
 div_penalty_alpha = None
 
 ux_lr = 1e-4
@@ -529,6 +521,7 @@ losses = model.optimize(
     n_samples=n_samples,
     p0_noise=noise0,
     px_noise=noise,
+    u_penalty_alpha=u_penalty_alpha,
     fokker_planck_alpha=fokker_planck_alpha,
     p0_alpha=p0_alpha,
     p_alpha=p_alpha,
@@ -543,20 +536,18 @@ print(f"Time elapsed: {end-start:.2f}s")
 
 # %%
 ux_lr = 1e-3
-fokker_planck_alpha = 1
-_ = model.optimize_fokker_planck(
+u_penalty_alpha = 1
+_ = model.optimize_u_penalized(
     X,
     ts,
     ux_lr=ux_lr,
-    fokker_planck_alpha=fokker_planck_alpha,
     noise=None,
-    n_epochs=500,
+    n_epochs=2500,
     n_samples=1e8,
     verbose=True,
 )
 
 # %%
-model = model.eval()
 xs = X.clone().detach()
 pxts = model.pxt.log_pxt(xs, ts).squeeze().T.cpu().detach().numpy()
 uxs = model.phi.u(xs).squeeze().cpu().detach().numpy()
@@ -657,7 +648,7 @@ axs.scatter(x_proj[:, 0], x_proj[:, 1], c=phi, cmap=viridis, s=1)
 plt.colorbar(axs.collections[0], ax=axs)
 axs.set_title("Scalar field $\phi(x)$")
 axs.set_xticks([])
-axs.set_yticks([])
+axs.set_yticks([]);
 # %%
 plt.plot(pxts.mean(axis=0), marker="o", markersize=2, c="blue")
 plt.ylabel("mean p(x,t)", c="blue")
@@ -708,7 +699,7 @@ plt.colorbar(axs[1].collections[0], ax=axs[1])
 # print('UX mean magnitude:')
 # for i in range(ux.shape[1]):
 #     print(f'{(ux**2).mean(0)[i].item():.4f}')# %%
-# %%
+4# %%
 fig, axs = plt.subplots(1, 2, figsize=(15, 7))
 axs[0].scatter(
     x_proj[:, 0], x_proj[:, 1], c=tonp((ux.abs()).sum(1)), cmap="viridis", s=1
