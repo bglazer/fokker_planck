@@ -114,6 +114,7 @@ p0_alpha = 1
 ux_lr = 1e-3
 pxt_lr = 1e-3
 model.train()
+u_and_p_detached = False
 losses = model.optimize(
     X=X,
     X0=X0,
@@ -129,6 +130,7 @@ losses = model.optimize(
     u_penalty_alpha=u_penalty_alpha,
     p0_alpha=p0_alpha,
     consistency_alpha=consistency_alpha,
+    u_and_p_detached=u_and_p_detached,
     verbose=True,
 )
 
@@ -296,75 +298,6 @@ plt.bar(data_bins[:-1], data_dist, width=w, alpha=0.3, label="Data")
 plt.ylabel("p(x)")
 plt.xlabel("x")
 plt.legend()
-# %%
-# Plot the dq_dx  and dq_dt terms for the Fokker-Planck equation
-xs = torch.arange(l, h, 0.01, device=device, requires_grad=True)[:, None]
-dq_dx, dq_dt = model.pxt.dx_dt(xs, ts)
-du_dx = model.phi.u.div(xs)[1]
-uxs = model.phi.u(xs)
-d_dx = ((dq_dx * uxs).sum(2) + du_dx)[..., None]
-fp_err = d_dx + dq_dt.sum(0)
-dq_dx = tonp(dq_dx)
-du_dx = tonp(du_dx)
-dq_dt = tonp(dq_dt)
-d_dx = tonp(d_dx)
-div_x = model.phi.u.div(xs)[1]
-div_x = tonp(div_x)
-xs = tonp(xs)
-uxs = tonp(uxs)
-fp_err = tonp(fp_err)
-miny, maxy = min(dq_dx.min(), dq_dt.min()) * 1.1, max(dq_dx.max(), dq_dt.max()) * 1.1
-reds = matplotlib.cm.get_cmap("Reds")
-
-tsi = np.linspace(0, len(ts) - 1, 5, dtype=int)
-fig, axs = plt.subplots(len(tsi), 1, figsize=(6, 5 * len(tsi)))
-
-span = slice(2974, (2974 * 2))
-
-for i in range(5):
-    # axs[i].plot(xs[span], (d_dx[tsi[i]])[span],
-    #             label='d_dx',
-    #             alpha=1, c='red', linewidth=.5)
-    # axs[i].plot(xs[span], (dq_dt[tsi[i]])[span],
-    #             label='dq_dt',
-    #             alpha=1, c='blue', linewidth=.5)
-    # axs[i].plot(xs[span], (dq_dx[tsi[i]])[span],
-    #             label='dq_dx', alpha=1, c='green', linewidth=.5)
-    # axs[i].plot(xs[span], (uxs[span]),
-    #             label='ux', alpha=1, c='orange', linewidth=.5)
-    axs[i].plot(
-        xs[span],
-        (dq_dx * uxs)[tsi[i]][span],
-        label="dq_dx * u(x)",
-        alpha=1,
-        c="black",
-        linewidth=0.5,
-    )
-    axs[i].plot(
-        xs[span],
-        (d_dx[tsi[i]] + dq_dt[tsi[i]])[span],
-        label="Fokker-Planck error",
-        alpha=1,
-        c="magenta",
-        linewidth=0.5,
-    )
-    # Summed FP error
-    # axs[i].plot(xs[span], (((d_dx + dq_dt)**2).mean(0))[span],
-    #             label='Fokker-Planck error',
-    #             alpha=1, c='purple', linewidth=.5)
-    # Cumulative FP error
-    # axs[i].plot(xs[span], np.cumsum(np.abs((fp_err[tsi[i]])[span]))/np.sum(np.abs(fp_err[tsi[i]][span])),
-    #             label='Cumulative Fokker-Planck error',
-    #             alpha=1, c='brown', linewidth=.5)
-    axs[i].plot(
-        xs[span], div_x[span], label="div u(x)", alpha=1, c="blue", linewidth=0.5
-    )
-    axs[i].axhline(0, c="grey", alpha=0.6, linewidth=0.4)
-    axs[i].axvline(0, c="grey", alpha=0.6, linewidth=0.4)
-# Put the legend on each plot
-for ax in axs:
-    ax.legend(bbox_to_anchor=(1.05, 1), loc="upper left")
-
 
 # %%
 # Plot the marginalized p(x) for each x
@@ -464,6 +397,7 @@ model = CellDelta(
     ux_layers=0,
     pxt_hidden_dim=64,
     pxt_layers=2,
+    use_whitening=False
 )
 
 # Compute the noise distribution from X_t instead of X
@@ -498,14 +432,14 @@ losses = model.optimize_initial_conditions(
 start = time.time()
 n_epochs = 2000
 n_samples = 1000
-p_alpha = 10
+p_alpha = 1
 p0_alpha = 1
-u_penalty_alpha = 1
+u_penalty_alpha = None
 fokker_planck_alpha = None
 time_prior_kl_alpha = None
 consistency_alpha = .001
 div_penalty_alpha = None
-
+u_and_p_detached = True
 ux_lr = 1e-4
 pxt_lr = 1e-4
 
@@ -528,6 +462,7 @@ losses = model.optimize(
     time_prior_kl_alpha=time_prior_kl_alpha,
     consistency_alpha=consistency_alpha,
     div_penalty_alpha=div_penalty_alpha,
+    u_and_p_detached=u_and_p_detached,
     verbose=True,
 )
 
@@ -542,12 +477,13 @@ _ = model.optimize_u_penalized(
     ts,
     ux_lr=ux_lr,
     noise=None,
-    n_epochs=2500,
+    n_epochs=500,
     n_samples=1e8,
     verbose=True,
 )
 
 # %%
+# Plot the pseudotime i.e. the timestep of maximum probability for each cell
 xs = X.clone().detach()
 pxts = model.pxt.log_pxt(xs, ts).squeeze().T.cpu().detach().numpy()
 uxs = model.phi.u(xs).squeeze().cpu().detach().numpy()
@@ -555,8 +491,6 @@ uxs = model.phi.u(xs).squeeze().cpu().detach().numpy()
 # pxt_dts = pxt_dts.detach().cpu().numpy()[:,:,0]
 
 xs = xs.squeeze().cpu().detach().numpy()
-# %%
-# Plot the pseudotime i.e. the timestep of maximum probability for each cell
 viridis = matplotlib.colormaps.get_cmap("viridis")
 fig, axs = plt.subplots(3, 1, figsize=(10, 15))
 
