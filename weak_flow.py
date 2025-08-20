@@ -303,21 +303,154 @@ def train(X0: np.ndarray,
     trainer = WeakFlowTrainer(cfg, X0, X)
     trainer.train()
     return trainer.potential.eval(), trainer.critic.eval()
+import contextlib
 
-# -----------------------
-# Example (commented)
-# -----------------------
-# if __name__ == "__main__":
-#     # Dummy synthetic 2D data to sanity-check the loop
-#     np.random.seed(0)
-#     N0, N = 20000, 20000
-#     d = 2
-#     # p0: Gaussian at (-2,0)
-#     X0 = np.random.randn(N0, d).astype(np.float32) + np.array([-2.0, 0.0], np.float32)
-#     # p: 50/50 mixture of two Gaussians (time-mixture stand-in)
-#     X1 = np.random.randn(N//2, d).astype(np.float32) + np.array([+2.0, 0.0], np.float32)
-#     X2 = np.random.randn(N//2, d).astype(np.float32) + np.array([-2.0, 2.5], np.float32)
-#     X  = np.concatenate([X1, X2], axis=0)
-#     # Train (small T, order=1)
-#     potential, critic = train(X0, X, T=0.5, order=1, steps=5000, batch_size=1024)
-#     # Use potential.drift(torch.tensor([...])) to evaluate u(x)
+# ---- helpers (no training grads) ----
+
+def _drift_eval(potential: PotentialNet, x: torch.Tensor) -> torch.Tensor:
+    """Evaluate u(x)=∇phi(x); returns detached tensor (B,d).
+    Uses first-order autograd only (no create_graph)."""
+    with torch.set_grad_enabled(True):
+        x_req = x.detach().requires_grad_(True)
+        phi = potential(x_req)                       # (B,1)
+        u = torch.autograd.grad(phi.sum(), x_req, create_graph=False, retain_graph=False)[0]
+    return u.detach()
+
+
+def _hutch_divergence(potential: PotentialNet, x: torch.Tensor, n_probe: int = 1) -> torch.Tensor:
+    """Estimate div u(x) with Hutchinson; returns (B,1), detached.
+    We need second-order grads (through u wrt x), but this is inference-only."""
+    with torch.set_grad_enabled(True):
+        x_req = x.detach().requires_grad_(True)
+        # need create_graph=True so we can differentiate u wrt x
+        phi = potential(x_req)
+        u = torch.autograd.grad(phi.sum(), x_req, create_graph=True, retain_graph=True)[0]
+        out = 0.0
+        for k in range(n_probe):
+            v = torch.randn_like(x_req)
+            v = v / (v.norm(dim=1, keepdim=True) + 1e-12)
+            retain = (k < n_probe - 1)
+            vjp = torch.autograd.grad(u, x_req, v, retain_graph=retain, create_graph=False)[0]  # J^T v
+            out = out + (v * vjp).sum(dim=1, keepdim=True)  # v^T J^T v; E[...] = tr(J) = div u
+    return out.detach() / float(n_probe)
+
+
+# ---- RK4 integrators ----
+
+def rk4_forward_step(potential: PotentialNet, x: torch.Tensor, dt: float) -> torch.Tensor:
+    """One RK4 step for x' = u(x)."""
+    k1 = _drift_eval(potential, x)
+    k2 = _drift_eval(potential, x + 0.5 * dt * k1)
+    k3 = _drift_eval(potential, x + 0.5 * dt * k2)
+    k4 = _drift_eval(potential, x + dt * k3)
+    return (x + (dt / 6.0) * (k1 + 2 * k2 + 2 * k3 + k4)).detach()
+
+
+def rk4_reverse_step(potential: PotentialNet, x: torch.Tensor, ds: float) -> torch.Tensor:
+    """One RK4 step for y' = -u(y) (reverse time)."""
+    k1 = -_drift_eval(potential, x)
+    k2 = -_drift_eval(potential, x + 0.5 * ds * k1)
+    k3 = -_drift_eval(potential, x + 0.5 * ds * k2)
+    k4 = -_drift_eval(potential, x + ds * k3)
+    return (x + (ds / 6.0) * (k1 + 2 * k2 + 2 * k3 + k4)).detach()
+
+
+# ---- Public APIs ----
+
+def pushforward(potential: PotentialNet, X0: torch.Tensor, t: float, steps: int = 80) -> torch.Tensor:
+    """Push a batch X0 ~ p0 forward under x' = u(x) for time t using RK4.
+    No training grads are recorded. Returns positions at time t on same device."""
+    dt = float(t) / max(1, int(steps))
+    x = X0.detach()
+    for _ in range(max(1, int(steps))):
+        x = rk4_forward_step(potential, x, dt)
+    return x
+
+
+def pushforward_snapshots(potential: PotentialNet, X0: torch.Tensor, T: float, K: int = 32, steps_per_unit: int = 40):
+    """Return K+1 snapshots Y_k at times t_k=k*T/K using RK4 forward integration."""
+    steps_total = max(1, int(steps_per_unit * float(T)))
+    dt = float(T) / steps_total
+    between = max(1, steps_total // K)
+    x = X0.detach()
+    snaps = [x.detach().clone()]
+    cut = between
+    for s in range(1, steps_total + 1):
+        x = rk4_forward_step(potential, x, dt)
+        if s == cut:
+            snaps.append(x.detach().clone())
+            cut += between
+            if len(snaps) == K + 1:
+                break
+    while len(snaps) < K + 1:
+        snaps.append(x.detach().clone())
+    return snaps  # list of tensors length K+1
+
+
+def logpt_reverse(potential: PotentialNet,
+                  logp0_fn,
+                  X: torch.Tensor,
+                  t: float,
+                  steps: int = 80,
+                  n_probe: int = 2) -> torch.Tensor:
+    """Compute log p_t(X) by reverse-time solve and divergence accumulation.
+
+    Args:
+        potential: trained PotentialNet (drift u=∇phi).
+        logp0_fn: callable taking a tensor (B,d) and returning log p0(x) with shape (B,1) or (B,).
+        X: (B,d) tensor of query points at time t.
+        t: scalar time ≥ 0.
+        steps: RK4 steps along [0,t].
+        n_probe: Hutchinson probe count per step (1–4 is typical).
+
+    Returns:
+        log p_t(X) as a tensor (B,1).
+    """
+    if t <= 0:
+        lp = logp0_fn(X)
+        return lp if lp.ndim == 2 else lp.view(-1, 1)
+
+    ds = float(t) / max(1, int(steps))
+    x = X.detach()
+    div_int = torch.zeros(X.size(0), 1, device=X.device)
+
+    for _ in range(max(1, int(steps))):
+        # RK4–consistent divergence quadrature at stage points
+        y1 = x
+        d1 = _hutch_divergence(potential, y1, n_probe)
+        k1 = -_drift_eval(potential, y1)
+
+        y2 = x + 0.5 * ds * k1
+        d2 = _hutch_divergence(potential, y2, n_probe)
+        k2 = -_drift_eval(potential, y2)
+
+        y3 = x + 0.5 * ds * k2
+        d3 = _hutch_divergence(potential, y3, n_probe)
+        k3 = -_drift_eval(potential, y3)
+
+        y4 = x + ds * k3
+        d4 = _hutch_divergence(potential, y4, n_probe)
+        k4 = -_drift_eval(potential, y4)
+
+        # advance state and integral
+        x = (x + (ds / 6.0) * (k1 + 2 * k2 + 2 * k3 + k4)).detach()
+        div_int = div_int + (ds / 6.0) * (d1 + 2 * d2 + 2 * d3 + d4)
+
+    # evaluate initial log-density at the recovered preimage
+    lp0 = logp0_fn(x)
+    if lp0.ndim == 1:
+        lp0 = lp0.view(-1, 1)
+    return (lp0 - div_int).detach()
+
+
+# ---- Optional: round-trip certification ----
+
+def roundtrip_error(potential: PotentialNet, X: torch.Tensor, t: float, steps: int = 80) -> torch.Tensor:
+    """Compute ||Φ_t(Φ_{-t}(X)) - X||_2 per sample with same RK4 discretization."""
+    x0_hat = X.detach()
+    for _ in range(max(1, int(steps))):
+        x0_hat = rk4_reverse_step(potential, x0_hat, float(t) / max(1, int(steps)))
+    x_fwd = x0_hat.detach()
+    for _ in range(max(1, int(steps))):
+        x_fwd = rk4_forward_step(potential, x_fwd, float(t) / max(1, int(steps)))
+    return ((x_fwd - X.detach())**2).sum(dim=1).sqrt()
