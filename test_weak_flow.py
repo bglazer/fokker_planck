@@ -1,182 +1,594 @@
 # %%
+"""
+weakflow.py
+
+Neural weak-form learning of a drift field u(x)=∇φ(x) from (p0, p) with uniform time-mixture on [0,T].
+- WGAN-style saddle objective on test functions (no ODE backprop during training)
+- Optional RK4 forward push and reverse-time log p_t inference for visualization/diagnostics.
+
+This file bundles:
+  * Models: PotentialNet (φ), CriticNet (f)
+  * Weak operators: L f, L^2 f, R_T f approximation
+  * Trainer: WeakFlowTrainer + convenience train(...)
+  * PCA utilities and plotting helpers
+  * ODE-based inference utilities (pushforward, log p_t via reverse solve)
+  * Example harness at bottom (can be run directly)
+"""
+from typing import Optional
+import math
 import numpy as np
 import torch
-from weak_flow import WeakFlowTrainer, Config  # from the file you already have
+from weak_flow import PotentialNet, WeakFlowTrainer, Config
+from tqdm.auto import tqdm
 import matplotlib.pyplot as plt
 import matplotlib.cm as cm
-from weak_flow import PotentialNet, pushforward_snapshots, logpt_reverse
-import math
 import time
 
 # %%
-# ==== Visual diagnostics for weak-form training (no long ODE runs) ====
-# --- helpers ---
-def pca_fit(X, n=2):
+
+# =====================
+# PCA utilities and visualization helpers
+# =====================
+
+
+def pca_fit(X: np.ndarray, n: int = 2):
     Xc = X - X.mean(0, keepdims=True)
     U, S, VT = np.linalg.svd(Xc, full_matrices=False)
-    comps = VT[:n, :]  # (n, d)
+    comps = VT[:n, :]
     mean = X.mean(0)
-    return mean, comps  # row-wise components
+    return mean, comps
 
 
-def pca_project(X, mean, comps):
-    return (X - mean) @ comps.T  # (N, n)
+def pca_project(X: np.ndarray, mean: np.ndarray, comps: np.ndarray) -> np.ndarray:
+    return (X - mean) @ comps.T
 
 
-def pca_unproject(Z, mean, comps):
-    # Z: (..., n) -> (..., d)
+def pca_unproject(Z: np.ndarray, mean: np.ndarray, comps: np.ndarray) -> np.ndarray:
     return Z @ comps + mean
 
 
 @torch.no_grad()
-def drift_batch(potential, X, device=None, bs=4096, freeze_params=True):
-    """
-    Evaluate u(x) = ∇_x phi_theta(x) in batches.
-    Keeps grad enabled w.r.t. x; optionally freezes params so no param grads are tracked.
-    """
+def drift_batch(
+    potential: PotentialNet,
+    X: np.ndarray,
+    device: Optional[torch.device] = None,
+    bs: int = 4096,
+) -> np.ndarray:
     device = device or next(iter(potential.parameters())).device
     was_training = potential.training
     potential.eval()
-
-    # Optionally freeze parameters to avoid tracking grads w.r.t. theta
-    param_flags = None
-    if freeze_params:
-        param_flags = [p.requires_grad for p in potential.parameters()]
-        for p in potential.parameters():
-            p.requires_grad_(False)
-
     out = []
-    # IMPORTANT: do NOT wrap this in torch.no_grad(); we need grads w.r.t. x
     with torch.set_grad_enabled(True):
         for i in range(0, X.shape[0], bs):
             xb = torch.from_numpy(X[i : i + bs]).float().to(device)
             xb.requires_grad_(True)
-            phi = potential(xb)  # (B,1)
-            u = torch.autograd.grad(phi.sum(), xb)[0]  # (B,d)
+            phi = potential(xb)
+            u = torch.autograd.grad(phi.sum(), xb)[0]
             out.append(u.detach().cpu().numpy())
-
-    # Restore parameter flags if we changed them
-    if freeze_params and param_flags is not None:
-        for p, flag in zip(potential.parameters(), param_flags):
-            p.requires_grad_(flag)
-
     if was_training:
         potential.train()
-
     return np.concatenate(out, axis=0)
 
 
-def L_f_pointwise(critic, potential, X, device=None, bs=4096):
-    device = device or next(iter(potential.parameters())).device
-    vals = []
-    for i in range(0, X.shape[0], bs):
-        xb = torch.from_numpy(X[i : i + bs]).float().to(device)
-        xb.requires_grad_(True)
-        f = critic(xb)  # (B,1)
-        gradf = torch.autograd.grad(f.sum(), xb, create_graph=False)[0]  # (B,d)
-        xb2 = xb.clone().detach().requires_grad_(True)
-        phi = potential(xb2)
-        u = torch.autograd.grad(phi.sum(), xb2, create_graph=False)[0]
-        vals.append((u * gradf).sum(1, keepdim=True).detach().cpu().numpy())
-    return np.concatenate(vals, axis=0)  # (N,1)
+# =====================
+# ODE-based inference utilities (forward push + reverse-time log p_t)
+# =====================
 
 
-def L2_f_pointwise(critic, potential, X, device=None, bs=2048):
-    device = device or next(iter(potential.parameters())).device
-    vals = []
-    for i in range(0, X.shape[0], bs):
-        xb = torch.from_numpy(X[i : i + bs]).float().to(device)
-        xb.requires_grad_(True)
-        # L f
-        f = critic(xb)
-        gradf = torch.autograd.grad(f.sum(), xb, create_graph=True)[0]
-        phi = potential(xb)
-        u = torch.autograd.grad(phi.sum(), xb, create_graph=True)[0]
-        L1 = (u * gradf).sum(1, keepdim=True)
-        # ∇(L1) · u
-        gradL1 = torch.autograd.grad(L1.sum(), xb, create_graph=False)[0]
-        vals.append((u * gradL1).sum(1, keepdim=True).detach().cpu().numpy())
-    return np.concatenate(vals, axis=0)
+def _drift_eval(potential: PotentialNet, x: torch.Tensor) -> torch.Tensor:
+    with torch.set_grad_enabled(True):
+        x_req = x.detach().requires_grad_(True)
+        phi = potential(x_req)
+        u = torch.autograd.grad(
+            phi.sum(), x_req, create_graph=False, retain_graph=False
+        )[0]
+    return u.detach()
 
 
-def RT_apply_numpy(critic, potential, X, T, order=1, device=None, bs=4096):
-    device = device or next(iter(potential.parameters())).device
-    out = []
-    for i in range(0, X.shape[0], bs):
-        xb = torch.from_numpy(X[i : i + bs]).float().to(device)
-        fb = critic(xb).detach().cpu().numpy()
-        if order >= 1:
-            L1 = L_f_pointwise(critic, potential, X[i : i + bs], device=device, bs=bs)
-            fb = fb + 0.5 * T * L1
-        if order >= 2:
-            L2 = L2_f_pointwise(
-                critic, potential, X[i : i + bs], device=device, bs=max(1024, bs // 2)
-            )
-            fb = fb + (T**2 / 6.0) * L2
-        out.append(fb)
-    return np.concatenate(out, axis=0)  # (N,1)
+def _hutch_divergence(
+    potential: PotentialNet, x: torch.Tensor, n_probe: int = 1
+) -> torch.Tensor:
+    with torch.set_grad_enabled(True):
+        x_req = x.detach().requires_grad_(True)
+        phi = potential(x_req)
+        u = torch.autograd.grad(phi.sum(), x_req, create_graph=True, retain_graph=True)[
+            0
+        ]
+        out = 0.0
+        for k in range(n_probe):
+            v = torch.randn_like(x_req)
+            v = v / (v.norm(dim=1, keepdim=True) + 1e-12)
+            retain = k < n_probe - 1
+            vjp = torch.autograd.grad(
+                u, x_req, v, retain_graph=retain, create_graph=False
+            )[0]
+            out = out + (v * vjp).sum(dim=1, keepdim=True)
+    return out.detach() / float(n_probe)
+
+
+def rk4_forward_step(
+    potential: PotentialNet, x: torch.Tensor, dt: float
+) -> torch.Tensor:
+    k1 = _drift_eval(potential, x)
+    k2 = _drift_eval(potential, x + 0.5 * dt * k1)
+    k3 = _drift_eval(potential, x + 0.5 * dt * k2)
+    k4 = _drift_eval(potential, x + dt * k3)
+    return (x + (dt / 6.0) * (k1 + 2 * k2 + 2 * k3 + k4)).detach()
+
+
+def rk4_reverse_step(
+    potential: PotentialNet, x: torch.Tensor, ds: float
+) -> torch.Tensor:
+    k1 = -_drift_eval(potential, x)
+    k2 = -_drift_eval(potential, x + 0.5 * ds * k1)
+    k3 = -_drift_eval(potential, x + 0.5 * ds * k2)
+    k4 = -_drift_eval(potential, x + ds * k3)
+    return (x + (ds / 6.0) * (k1 + 2 * k2 + 2 * k3 + k4)).detach()
+
+
+def pushforward(
+    potential: PotentialNet, X0: torch.Tensor, t: float, steps: int = 80
+) -> torch.Tensor:
+    dt = float(t) / max(1, int(steps))
+    x = X0.detach()
+    for _ in range(max(1, int(steps))):
+        x = rk4_forward_step(potential, x, dt)
+    return x
+
+
+def pushforward_snapshots(
+    potential: PotentialNet, X0: torch.Tensor, T: float, K: int = 32
+):
+    """Uniform-grid forward snapshots at times {0, dt, 2dt, ..., T} with dt=T/K."""
+    K = int(K)
+    dt = float(T) / max(1, K)
+    x = X0.detach()
+    snaps = [x.detach().clone()]
+    for _ in range(1, K + 1):
+        x = rk4_forward_step(potential, x, dt)
+        snaps.append(x.detach().clone())
+    return snaps
+
+
+def logpt_reverse(
+    potential: PotentialNet,
+    logp0_fn,
+    X: torch.Tensor,
+    t: float,
+    steps: int = 80,
+    n_probe: int = 2,
+) -> torch.Tensor:
+    if t <= 0:
+        lp = logp0_fn(X)
+        return lp if lp.ndim == 2 else lp.view(-1, 1)
+    ds = float(t) / max(1, int(steps))
+    x = X.detach()
+    div_int = torch.zeros(X.size(0), 1, device=X.device)
+    for _ in range(max(1, int(steps))):
+        y1 = x
+        d1 = _hutch_divergence(potential, y1, n_probe)
+        k1 = -_drift_eval(potential, y1)
+        y2 = x + 0.5 * ds * k1
+        d2 = _hutch_divergence(potential, y2, n_probe)
+        k2 = -_drift_eval(potential, y2)
+        y3 = x + 0.5 * ds * k2
+        d3 = _hutch_divergence(potential, y3, n_probe)
+        k3 = -_drift_eval(potential, y3)
+        y4 = x + ds * k3
+        d4 = _hutch_divergence(potential, y4, n_probe)
+        k4 = -_drift_eval(potential, y4)
+        x = (x + (ds / 6.0) * (k1 + 2 * k2 + 2 * k3 + k4)).detach()
+        div_int = div_int + (ds / 6.0) * (d1 + 2 * d2 + 2 * d3 + d4)
+    lp0 = logp0_fn(x)
+    if lp0.ndim == 1:
+        lp0 = lp0.view(-1, 1)
+    return (lp0 - div_int).detach()
+
+
+def roundtrip_error(
+    potential: PotentialNet, X: torch.Tensor, t: float, steps: int = 80
+) -> torch.Tensor:
+    x0_hat = X.detach()
+    ds = float(t) / max(1, int(steps))
+    for _ in range(max(1, int(steps))):
+        x0_hat = rk4_reverse_step(potential, x0_hat, ds)
+    x_fwd = x0_hat.detach()
+    for _ in range(max(1, int(steps))):
+        x_fwd = rk4_forward_step(potential, x_fwd, ds)
+    return ((x_fwd - X.detach()) ** 2).sum(dim=1).sqrt()
+
+
+# =====================
+# Synthetic data generators
+# =====================
 
 
 def make_linear_translation_data(
-    N0=20000, N=20000, d=2, T=100, sigma=1.0, discrete=True, shift_per_unit=1.0, seed=0
+    N0: int = 20000,
+    N: int = 20000,
+    d: int = 2,
+    T: int = 100,
+    sigma: float = 1.0,
+    discrete: bool = True,
+    shift_per_unit: float = 1.0,
+    seed: int = 0,
 ):
-    """
-    p0 = N(0, sigma^2 I_d)
-    For t in [0,T], p_t = N(t * v, sigma^2 I_d), where v = shift_per_unit * e1.
-    If discrete=True, t is uniform on {0,1,...,T}; else t ~ Uniform[0,T] (continuous).
-    Returns X0 ~ p0, X ~ time-mixture of {p_t}.
-    """
     rng = np.random.default_rng(seed)
     v = np.zeros(d, dtype=np.float32)
     v[0] = float(shift_per_unit)
-
-    # Initial samples
     X0 = rng.normal(0.0, sigma, size=(N0, d)).astype(np.float32)
-
-    # Time samples
     if discrete:
-        ts = rng.integers(low=0, high=T + 1, size=N).astype(np.float32)  # {0,...,T}
+        ts = rng.integers(low=0, high=T + 1, size=N).astype(np.float32)
     else:
-        ts = rng.random(N).astype(np.float32) * float(T)  # [0, T)
-
-    # Mixture samples
+        ts = rng.random(N).astype(np.float32) * float(T)
     eps = rng.normal(0.0, sigma, size=(N, d)).astype(np.float32)
     X = ts[:, None] * v[None, :] + eps
-
-    # Quick sanity checks
-    E_X0 = X0.mean(0)
-    E_X = X.mean(0)
-    # Theoretical mean for the mixture along v-direction:
-    if discrete:
-        E_t = T / 2.0
-    else:
-        E_t = T / 2.0
+    EX0, EX = X0.mean(0), X.mean(0)
     print(
-        f"[sanity] mean(X0)[0]={E_X0[0]:+.3f}, mean(X)[0]={E_X[0]:+.3f}, expected ≈ {E_t*shift_per_unit:+.3f}"
+        f"[sanity] mean(X0)[0]={EX0[0]:+.3f}, mean(X)[0]={EX[0]:+.3f}, expected ≈ {(T/2.0)*shift_per_unit:+.3f}"
     )
     return X0, X, v
 
 
-# %%
-# --- generate data ---
-d = 500
-T = 4
-X0, X, v_true = make_linear_translation_data(
-    N0=20000, N=40000, d=d, T=T, sigma=1.0, discrete=False, shift_per_unit=1.0, seed=42
-)
-# %%
+# ---- generic integrator + generator for arbitrary drift fields ----
+
+
+def rk4_step_u(u_fn, x: torch.Tensor, dt: float) -> torch.Tensor:
+    k1 = u_fn(x)
+    k2 = u_fn(x + 0.5 * dt * k1)
+    k3 = u_fn(x + 0.5 * dt * k2)
+    k4 = u_fn(x + dt * k3)
+    return x + (dt / 6.0) * (k1 + 2 * k2 + 2 * k3 + k4)
+
+
+def integrate_field(u_fn, x0: torch.Tensor, K: int, dt: float) -> torch.Tensor:
+    """Uniform time grid integrator for x' = u(x) using RK4.
+    Args:
+      u_fn: (B,d)->(B,d)
+      x0:  (B,d) starting points
+      K:   total number of uniform steps covering [0,T]
+      dt:  step size so that K*dt = T
+    Returns:
+      (B,d) tensor at t = k_i*dt for each sample 
+    """
+    x = x0.detach()
+    for _ in range(int(K)):
+        x = rk4_step_u(u_fn, x, dt)
+    return x
+
+
+def generate_mixture_from_field(
+    u_fn, d: int, N0: int, N: int, T: float, K: int, sigma: float = 1.0, seed: int = 0
+):
+    """Uniform-grid mixture: draw k ~ Uniform{0..K}, integrate each sample for k steps of dt=T/K."""
+    rng = np.random.default_rng(seed)
+    X0 = rng.normal(0.0, sigma, size=(N0, d)).astype(np.float32)
+    # mixture start points ~ N(0,σ^2 I)
+    Xstart = rng.normal(0.0, sigma, size=(N, d)).astype(np.float32)
+    k_idx = rng.integers(low=0, high=int(K) + 1, size=N, dtype=np.int64)
+    dt = float(T) / float(K)
+    dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    with torch.no_grad():
+        Xstart_t = torch.from_numpy(Xstart).float().to(dev)
+        k_t = torch.from_numpy(k_idx).to(dev)
+        X_t = integrate_field(u_fn, Xstart_t, K=int(K), dt=dt)
+        X = X_t.cpu().numpy()
+    ts = k_idx.astype(np.float32) * dt
+    return X0, X, ts
+
+
+# ---- Test 2: Linear drift u(x)=B x ----
+
+
+def make_linear_B_data(
+    B: np.ndarray,
+    N0: int = 20000,
+    N: int = 40000,
+    T: float = 4.0,
+    K: int = 64,
+    sigma0: float = 1.0,
+    seed: int = 0,
+):
+    d = B.shape[0]
+    dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    B_t = torch.from_numpy(B.astype(np.float32)).to(dev)
+
+    def u_fn(x: torch.Tensor) -> torch.Tensor:
+        return x @ B_t.T
+
+    X0, X, ts = generate_mixture_from_field(
+        u_fn, d=d, N0=N0, N=N, T=T, K=K, sigma=sigma0, seed=seed
+    )
+    return X0, X, ts, u_fn
+
+
+# helper constructors for B (2D blocks)
+
+
+def B_rotation_2d(omega: float) -> np.ndarray:
+    return np.array([[0.0, -omega], [omega, 0.0]], dtype=np.float32)
+
+
+def B_sink_source_2d(lmbda: float) -> np.ndarray:
+    return np.array([[lmbda, 0.0], [0.0, lmbda]], dtype=np.float32)
+
+
+def B_saddle_2d(lpos: float, lneg: float) -> np.ndarray:
+    return np.array([[lpos, 0.0], [0.0, -abs(lneg)]], dtype=np.float32)
+
+
+def B_spiral_sink_2d(omega: float, rho: float) -> np.ndarray:
+    return np.array([[rho, -omega], [omega, rho]], dtype=np.float32)
+
+
+# ---- Test 3: Nonlinear gradient flow (double-well) ----
+
+
+def make_double_well_data(
+    d: int = 2,
+    alpha: float = 0.5,
+    N0: int = 20000,
+    N: int = 40000,
+    T: float = 4.0,
+    K: int = 64,
+    sigma0: float = 0.5,
+    seed: int = 0,
+):
+    dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    def u_fn(x: torch.Tensor) -> torch.Tensor:
+        x1 = x[:, :1]
+        rest = x[:, 1:]
+        g1 = x1 * (x1 * x1 - 1.0)
+        if rest.shape[1] > 0:
+            grest = alpha * rest
+            return torch.cat([g1, grest], dim=1)
+        else:
+            return g1
+
+    X0, X, ts = generate_mixture_from_field(
+        u_fn, d=d, N0=N0, N=N, T=T, K=K, sigma=sigma0, seed=seed
+    )
+    return X0, X, ts, u_fn
+
+
+# ---- Test 4: Branching drift (Y-shaped) ----
+
+
+def make_branching_data(
+    d: int = 2,
+    v_root: float = 1.0,
+    v_branch: float = 1.0,
+    xsplit: float = 1.0,
+    beta: float = 3.0,
+    N0: int = 20000,
+    N: int = 40000,
+    T: float = 4.0,
+    K: int = 64,
+    sigma0: float = 0.5,
+    seed: int = 0,
+):
+    dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    e1 = torch.zeros(d, device=dev)
+    e1[0] = 1.0
+    e1 = e1.view(1, -1)
+    vA = torch.zeros(d, device=dev)
+    vA[:2] = torch.tensor([1.0, 1.0], device=dev)
+    vA = (v_branch * vA).view(1, -1)
+    vB = torch.zeros(d, device=dev)
+    vB[:2] = torch.tensor([1.0, -1.0], device=dev)
+    vB = (v_branch * vB).view(1, -1)
+
+    def u_fn(x):
+        s = torch.sigmoid(beta * (x[:, :1] - xsplit))       # gate turns on after split
+        base = (v_root * x[:, :1]) * e1                     # or use constant base: v_root * e1.expand_as(x)
+        side = torch.where(x[:,1:2] >= 0, s * vA, s * vB)   # <-- changed
+        return base + side
+
+    X0, X, ts = generate_mixture_from_field(
+        u_fn, d=d, N0=N0, N=N, T=T, K=K, sigma=sigma0, seed=seed
+    )
+    return X0, X, ts, u_fn
+
+
+# ---- Test 5: Spiral dynamics embedded in R^d with nuisance dims ----
+def make_spiral_manifold_noise_data(
+    d: int = 10,
+    omega: float = 1.0,
+    rho: float = -0.2,
+    N0: int = 20000,
+    N: int = 40000,
+    T: float = 6.0,
+    K: int = 96,
+    sigma0: float = 0.5,
+    seed: int = 0,
+):
+    assert d >= 2
+    dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    M = torch.tensor([[rho, -omega], [omega, rho]], device=dev)
+
+    def u_fn(x: torch.Tensor) -> torch.Tensor:
+        x01 = x[:, :2]
+        u01 = x01 @ M.T
+        if d > 2:
+            zeros = torch.zeros(x.size(0), d - 2, device=dev)
+            return torch.cat([u01, zeros], dim=1)
+        else:
+            return u01
+
+    X0, X, ts = generate_mixture_from_field(
+        u_fn, d=d, N0=N0, N=N, T=T, K=K, sigma=sigma0, seed=seed
+    )
+    return X0, X, ts, u_fn
+
+#%%
+# --- choose which synthetic to run ---
+TEST_ID = 4  # 1: translation (baseline), 2: linear B, 3: double-well, 4: branching, 5: spiral+noise
+
+d = 2
+T = 4.0
+
+if TEST_ID == 1:
+    X0, X, v_true = make_linear_translation_data(
+        N0=20000,
+        N=40000,
+        d=d,
+        T=int(T),
+        sigma=1.0,
+        shift_per_unit=1.0,
+        seed=42,
+    )
+    u_true_fn = None  # constant v only known along e1; we skip field metrics here
+
+elif TEST_ID == 2:
+    # Linear drift with a 2D spiral sink embedded in d-D by padding zeros in higher dims
+    B2 = B_spiral_sink_2d(omega=1.2, rho=-0.2)
+    B = np.zeros((d, d), dtype=np.float32)
+    B[:2, :2] = B2
+    X0, X, ts, u_true_fn = make_linear_B_data(
+        B,
+        N0=20000,
+        N=40000,
+        T=T,
+        sigma0=1.0,
+        seed=42,
+    )
+
+elif TEST_ID == 3:
+    X0, X, ts, u_true_fn = make_double_well_data(
+        d=d,
+        alpha=0.5,
+        N0=20000,
+        N=40000,
+        T=T,
+        sigma0=0.5,
+        seed=42,
+    )
+
+elif TEST_ID == 4:
+    X0, X, ts, u_true_fn = make_branching_data(
+        d=d,
+        v_root=0.8,
+        v_branch=1.2,
+        xsplit=1.0,
+        beta=3.0,
+        N0=20000,
+        N=40000,
+        T=T,
+        sigma0=0.5,
+        seed=42,
+    )
+
+elif TEST_ID == 5:
+    d = 20  # emphasize nuisance dims
+    X0, X, ts, u_true_fn = make_spiral_manifold_noise_data(
+        d=d,
+        omega=1.0,
+        rho=-0.1,
+        N0=20000,
+        N=40000,
+        T=6.0,
+        sigma0=0.5,
+        seed=42,
+    )
+    T = 6.0
+else:
+    raise ValueError("TEST_ID must be in {1,2,3,4,5}")
+#%%
+class ZScoreStandardizer:
+    def __init__(self, eps: float = 1e-8):
+        self.mu = None
+        self.sigma = None
+        self.eps = eps
+
+    def fit(self, X0: np.ndarray, X: np.ndarray, use_union: bool = True):
+        """Estimate per-dim mean/std from X0 or from the union (X0 ∪ X)."""
+        if use_union:
+            U = np.vstack([X0, X])
+        else:
+            U = X0
+        self.mu = U.mean(0)
+        self.sigma = U.std(0, ddof=0)
+        # avoid divide-by-zero
+        self.sigma = np.where(self.sigma < self.eps, 1.0, self.sigma)
+        return self
+
+    def transform(self, A: np.ndarray) -> np.ndarray:
+        assert self.mu is not None, "Call fit(...) first"
+        return (A - self.mu) / self.sigma
+
+    def inverse_transform(self, Z: np.ndarray) -> np.ndarray:
+        assert self.mu is not None, "Call fit(...) first"
+        return Z * self.sigma + self.mu
+
+    # Convenience tensors for PyTorch
+    def to_torch(self, device="cpu"):
+        mu_t = torch.from_numpy(self.mu.astype(np.float32)).to(device)
+        sigma_t = torch.from_numpy(self.sigma.astype(np.float32)).to(device)
+        return mu_t, sigma_t
+
+class AutoTuner:
+    def __init__(self, gap_target=2.0, sob_band=(1.0,10.0), smooth_band=(1.0,5.0)):
+        self.gap_target = gap_target
+        self.sob_lo, self.sob_hi = sob_band
+        self.sm_lo, self.sm_hi = smooth_band
+        self.streak_small_gap = 0
+
+    def step(self, trainer, gap_d_ma, sob_ma, smooth_ma):
+        cfg = trainer.cfg
+        updates = {}
+        # drift magnitude control
+        if smooth_ma > self.sm_hi:
+            cfg.drift_l2_weight *= 2.0
+            updates['drift_l2_weight'] = cfg.drift_l2_weight
+        elif smooth_ma < 0.5 * self.sm_lo and gap_d_ma > self.gap_target:
+            cfg.drift_l2_weight /= 1.5
+            updates['drift_l2_weight'] = cfg.drift_l2_weight
+        # critic roughness control
+        if sob_ma < 0.5 * self.sob_lo and gap_d_ma > self.gap_target:
+            cfg.sobolev_weight /= 1.5
+            updates['sobolev_weight'] = cfg.sobolev_weight
+        # time continuation
+        if gap_d_ma < self.gap_target and self.sm_lo <= smooth_ma <= self.sm_hi and self.sob_lo <= sob_ma <= self.sob_hi:
+            self.streak_small_gap += 1
+            if self.streak_small_gap >= 3:
+                cfg.T = min(cfg.T * 1.25, 4.0)
+                self.streak_small_gap = 0
+                updates['T'] = cfg.T
+        else:
+            self.streak_small_gap = 0
+        # stabilize if mismatch persists
+        if gap_d_ma > 2 * self.gap_target and self.sm_lo <= smooth_ma <= self.sm_hi and self.sob_lo <= sob_ma <= self.sob_hi:
+            for g in trainer.opt_p.param_groups:
+                g['lr'] = max(g['lr'] * 0.5, 5e-5)
+                updates['lr_potential'] = g['lr']
+            cfg.n_critic = 2
+            updates['n_critic'] = cfg.n_critic
+        return updates
+
+#%%
+autotuner = AutoTuner()
+
+#%%
+# Standardize X and X0 using the ZScoreStandardizer
+standardizer = ZScoreStandardizer()
+standardizer.fit(X0, X)
+X0 = standardizer.transform(X0)
+X = standardizer.transform(X)
+
+#%%
 # --- trainer config ---
 cfg = Config(
     d=d,
-    T=T,
+    T=.25,
     order=1,
-    steps=500,
+    steps=1500,
     batch_size=1024,
     n_critic=1,
-    lr_potential=5e-4,
+    lr_potential=1e-4,
     lr_critic=1e-4,
-    sobolev_weight=5e-2,
-    drift_l2_weight=1e-4,
+    sobolev_weight=.5,
+    drift_l2_weight=1e-3,
     critic_width=128,
     critic_depth=3,
     spectral_norm_critic=True,
@@ -185,20 +597,16 @@ cfg = Config(
     mixed_precision=False,
     device=("cuda" if torch.cuda.is_available() else "cpu"),
     log_every=50,
+    diffusion_D=0.0,
+    lap_probes=2,
 )
+#%%
 trainer = WeakFlowTrainer(cfg, X0, X)
-# %%
-# Training
-# T-continuation
-import time
+#%%
 start = time.time()
-T_target = cfg.T
-trainer.cfg.T = min(0.5, 0.25 * T_target)
 for step in range(1, cfg.steps + 1):
     gap_c, sp = trainer.critic_step()
     gap_d, sm, loss_d = trainer.drift_step()
-    if step % 500 == 0:
-        trainer.cfg.T = min(T_target, trainer.cfg.T * 1.25)
     if step % cfg.log_every == 0:
         with torch.no_grad():
             dev = trainer.device
@@ -206,22 +614,27 @@ for step in range(1, cfg.steps + 1):
             x0b = torch.from_numpy(X0[:2048]).float().to(dev)
             Ep = trainer.critic(xb).mean().item()
             Ep0 = trainer.critic(x0b).mean().item()
+            updated_params = autotuner.step(trainer, gap_d, sp, sm)
+
         print(
             f"[{step:05d}] gap_c={gap_c:+.3e} gap_d={gap_d:+.3e} sob={sp:.2e} smooth={sm:.2e} "
             f"T_now={trainer.cfg.T:.2f} ord={trainer.cfg.order} Ep={Ep:+.2e} Ep0={Ep0:+.2e}"
         )
+        print(f'param updates: {updated_params}')
 end = time.time()
-print(f"Training completed in {end - start:.2f} seconds")
-# %%
+print(f'Elapsed time: {end - start:.2f} seconds')
+#%%
 potential, critic = trainer.potential.eval(), trainer.critic.eval()
 #%%
-# --- 1) Vector field in PCA plane ---
+# --- PCA projection for plots ---
 X_all = np.vstack([X0, X])
 mean, comps = pca_fit(X_all, n=2)
 Z0 = pca_project(X0, mean, comps)
 Z = pca_project(X, mean, comps)
+
+# --- Vector field in PCA plane ---
 nq = 25
-marg = 0.05
+marg = 0.00
 mins = np.quantile(Z, q=marg, axis=0)
 maxs = np.quantile(Z, q=1 - marg, axis=0)
 gx = np.linspace(mins[0], maxs[0], nq)
@@ -229,17 +642,30 @@ gy = np.linspace(mins[1], maxs[1], nq)
 GX, GY = np.meshgrid(gx, gy)
 G2 = np.stack([GX.ravel(), GY.ravel()], axis=1)
 G_full = pca_unproject(G2, mean, comps)
+
+# learned field
 U_full = drift_batch(potential, G_full)
 U2 = U_full @ comps.T
 U2 = U2 / (np.linalg.norm(U2, axis=1, keepdims=True) + 1e-8) * 0.2
-plt.figure(figsize=(6, 6))
+
+# true field (if available)
+Utrue2 = None
+if u_true_fn is not None:
+    dev = next(iter(potential.parameters())).device
+    with torch.no_grad():
+        G_full_t = torch.from_numpy(G_full).float().to(dev)
+        U_true_full = u_true_fn(G_full_t).detach().cpu().numpy()
+    Utrue2 = U_true_full @ comps.T
+    Utrue2 = Utrue2 / (np.linalg.norm(Utrue2, axis=1, keepdims=True) + 1e-8) * 0.2
+
+plt.figure(figsize=(12, 12))
 idx0 = np.random.choice(Z0.shape[0], size=min(5000, Z0.shape[0]), replace=False)
 idx = np.random.choice(Z.shape[0], size=min(5000, Z.shape[0]), replace=False)
 plt.scatter(Z0[idx0, 0], Z0[idx0, 1], s=5, alpha=0.35, label="X0 (p0)")
 plt.scatter(Z[idx, 0], Z[idx, 1], s=5, alpha=0.35, label="X (mixture)")
-plt.quiver(
-    G2[:, 0], G2[:, 1], U2[:, 0], U2[:, 1], angles="xy", scale_units="xy", scale=1
-)
+plt.quiver(G2[:, 0], G2[:, 1], U2[:, 0], U2[:, 1], angles="xy", scale_units="xy", scale=1, color="purple", label="u_hat")
+if Utrue2 is not None:
+    plt.quiver(G2[:, 0], G2[:, 1], Utrue2[:, 0], Utrue2[:, 1], angles="xy", scale_units="xy", scale=1, color="green", alpha=0.8, label="u_true")
 plt.legend()
 plt.title("Projected drift field (PCA 2D) with X0 and X")
 plt.xlabel("PC1")
@@ -247,15 +673,16 @@ plt.ylabel("PC2")
 plt.tight_layout()
 plt.show()
 #%%
-# --- 2) Forward simulation snapshots ---
-
-N_plot = min(400, X0.shape[0])
+# Simulate forward
+N_plot = min(4000, X0.shape[0])
 idx0_vis = np.random.choice(X0.shape[0], size=N_plot, replace=False)
 X0_vis_t = (
-    torch.from_numpy(X0[idx0_vis]).float().to(next(iter(potential.parameters())).device)
+    torch.from_numpy(X0[idx0_vis])
+    .float()
+    .to(next(iter(potential.parameters())).device)
 )
 K = 20
-snaps = pushforward_snapshots(potential, X0_vis_t, T=T, K=K, steps_per_unit=40)
+snaps = pushforward_snapshots(potential, X0_vis_t, T=T, K=K)
 plt.figure(figsize=(6, 6))
 colors = cm.viridis(np.linspace(0, 1, len(snaps)))
 for k, Yk in enumerate(snaps):
@@ -267,13 +694,20 @@ for k, Yk in enumerate(snaps):
         s=5,
         color=colors[k],
         alpha=alpha,
-        label=None if k not in (0, len(snaps) - 1) else ("t=0" if k == 0 else f"t={T}"),
+        label=(
+            None
+            if k not in (0, len(snaps) - 1)
+            else ("t=0" if k == 0 else f"t={T}")
+        ),
     )
-# use ScalarMappable for the colorbar without extra scatter
-from matplotlib.cm import ScalarMappable
-from matplotlib.colors import Normalize
-sm = ScalarMappable(cmap="viridis", norm=Normalize(vmin=0, vmax=len(snaps)-1))
-sm.set_array([])
+
+# Overlay a sample of the actual data points, colored grey with 50% opacity
+idx_vis = np.random.choice(X.shape[0], size=N_plot, replace=False)
+Z_vis = pca_project(X[idx_vis], mean, comps)
+plt.scatter(Z_vis[:, 0], Z_vis[:, 1], s=5, color="grey", alpha=0.5, label="X (actual)")
+
+# sm = cm.ScalarMappable(cmap=cm.viridis)
+# sm.set_array([])
 # cbar = plt.colorbar(sm, shrink=0.8)
 # cbar.set_label("time slice index (0→T)")
 plt.title("Forward pushforward snapshots (PCA plane)")
@@ -281,22 +715,45 @@ plt.xlabel("PC1")
 plt.ylabel("PC2")
 plt.tight_layout()
 plt.show()
+
 #%%
-# --- 3) Inference of t*(x) = argmax_t log p_t(x) ---
+# --- Field metrics if u_true_fn is available ---
+if u_true_fn is not None:
+    dev = next(iter(potential.parameters())).device
+    # with torch.no_grad():
+    pts = (
+        torch.from_numpy(
+            X[np.random.choice(X.shape[0], size=5000, replace=False)]
+        )
+        .float()
+        .to(dev)
+    )
+    u_hat = potential.drift(pts)
+    u_true = u_true_fn(pts)
+    mse = torch.mean((u_hat - u_true) ** 2).item()
+    cos = torch.mean(
+        torch.sum(u_hat * u_true, dim=1)
+        / (u_hat.norm(dim=1) * u_true.norm(dim=1) + 1e-8)
+    ).item()
+    print(f"[metrics] MSE(u): {mse:.4e} | mean cos(u, u_true): {cos:.4f}")
+#%%
+# --- t*(x) inference demo (valid for D=0) ---
 mu0_t = (
-    torch.from_numpy(X0.mean(0)).float().to(next(iter(potential.parameters())).device)
+    torch.from_numpy(X0.mean(0))
+    .float()
+    .to(next(iter(potential.parameters())).device)
 )
 X0_t = torch.from_numpy(X0).float().to(mu0_t.device)
 cov0_t = torch.cov(X0_t.T) + 1e-6 * torch.eye(X0_t.size(1), device=mu0_t.device)
 L0 = torch.linalg.cholesky(cov0_t)
 inv_cov0 = torch.cholesky_inverse(L0)
-const0 = -0.5 * X0_t.size(1) * math.log(2 * math.pi) - torch.log(torch.diag(L0)).sum()
-
+const0 = (
+    -0.5 * X0_t.size(1) * math.log(2 * math.pi) - torch.log(torch.diag(L0)).sum()
+)
 
 def logp0_gaussian(x: torch.Tensor) -> torch.Tensor:
     xc = x - mu0_t
     return const0 - 0.5 * (xc * (xc @ inv_cov0)).sum(dim=1, keepdim=True)
-
 
 @torch.no_grad()
 def argmax_t_for_batch(
@@ -304,15 +761,15 @@ def argmax_t_for_batch(
     logp0_fn,
     X_t: torch.Tensor,
     T: float,
-    n_grid: int = 64,
-    steps: int = 80,
+    K: int = 64,
     n_probe: int = 2,
-    refine: bool = True,
 ):
-    ts = torch.linspace(0.0, float(T), steps=n_grid, device=X_t.device)
+    """Evaluate log p_t on the uniform grid t_k=k*T/K and return argmax over k."""
+    K = int(K)
+    ts = torch.linspace(0.0, float(T), steps=K + 1, device=X_t.device)
     vals = [
         logpt_reverse(
-            potential, logp0_fn, X_t, float(tval.item()), steps=steps, n_probe=n_probe
+            potential, logp0_fn, X_t, float(tval.item()), steps=K, n_probe=n_probe
         )
         for tval in ts
     ]
@@ -320,33 +777,13 @@ def argmax_t_for_batch(
     idx = torch.argmax(L, dim=1)
     t_star = ts[idx].unsqueeze(1)
     logp_star = L.gather(1, idx.unsqueeze(1))
-    if refine and n_grid >= 3:
-        i0 = torch.clamp(idx - 1, 0, n_grid - 1)
-        i2 = torch.clamp(idx + 1, 0, n_grid - 1)
-        need = (i2 - i0) == 2
-        if need.any():
-            t1 = ts[i0][need]
-            t2 = ts[idx][need]
-            t3 = ts[i2][need]
-            L1 = L[need, i0[need]]
-            L2 = L[need, idx[need]]
-            L3 = L[need, i2[need]]
-            denom = t1 - 2 * t2 + t3
-            denom[denom.abs() < 1e-12] = 1e-12
-            t_vert = (t2 + 0.5 * ((t1 - t3) * (L1 - L3)) / denom).clamp(t1, t3)
-            lp_ref = logpt_reverse(
-                potential, logp0_fn, X_t[need], t_vert, steps=steps, n_probe=n_probe
-            )
-            t_star[need] = t_vert.unsqueeze(1)
-            logp_star[need] = lp_ref
     return t_star, logp_star, ts, L
-
 
 B_eval = min(8000, X.shape[0])
 idx_eval = np.random.choice(X.shape[0], size=B_eval, replace=False)
 X_eval_t = torch.from_numpy(X[idx_eval]).float().to(mu0_t.device)
 _t_star, _logp_star, ts_grid, Lgrid = argmax_t_for_batch(
-    potential, logp0_gaussian, X_eval_t, T=T, n_grid=64, steps=80, n_probe=2
+    potential, logp0_gaussian, X_eval_t, T=T, K=K_GEN, n_probe=2
 )
 t_star_np = _t_star.squeeze(1).cpu().numpy()
 plt.figure(figsize=(6, 4))
@@ -356,6 +793,7 @@ plt.ylabel("density")
 plt.title("Inferred latent times $t^*(x)$ for a subset of X")
 plt.tight_layout()
 plt.show()
+
 Z_eval = pca_project(X[idx_eval], mean, comps)
 plt.figure(figsize=(6, 6))
 sc = plt.scatter(
@@ -368,4 +806,3 @@ plt.xlabel("PC1")
 plt.ylabel("PC2")
 plt.tight_layout()
 plt.show()
-# %%
