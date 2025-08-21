@@ -1,8 +1,7 @@
-#%%
+# %%
 # # =====================
 # Experiment / diagnostics (consolidated)
 # =====================
-from typing import Optional
 import math
 import numpy as np
 import torch
@@ -10,159 +9,18 @@ from weak_flow import WeakFlowTrainer, Config, PotentialNet
 import matplotlib.pyplot as plt
 from matplotlib import cm
 import time
-#%%
-
-# PCA helpers
-
-def pca_fit(X: np.ndarray, n: int = 2):
-    Xc = X - X.mean(0, keepdims=True)
-    U, S, VT = np.linalg.svd(Xc, full_matrices=False)
-    comps = VT[:n, :]
-    mean = X.mean(0)
-    return mean, comps
-
-
-def pca_project(X: np.ndarray, mean: np.ndarray, comps: np.ndarray) -> np.ndarray:
-    return (X - mean) @ comps.T
+from weak_flow_util import (
+    rk4_forward_step,
+    rk4_reverse_step,
+    logpt_reverse,
+    drift_batch,
+    generate_mixture_from_field,
+    pca_project,
+    pca_unproject,
+)
 
 
-def pca_unproject(Z: np.ndarray, mean: np.ndarray, comps: np.ndarray) -> np.ndarray:
-    return Z @ comps + mean
-
-
-def drift_batch(
-    potential: PotentialNet,
-    X: np.ndarray,
-    device: Optional[torch.device] = None,
-    bs: int = 4096,
-) -> np.ndarray:
-    device = device or next(iter(potential.parameters())).device
-    was_training = potential.training
-    potential.eval()
-    out = []
-    for i in range(0, X.shape[0], bs):
-        xb = torch.from_numpy(X[i : i + bs]).float().to(device)
-        xb.requires_grad_(True)
-        phi = potential(xb)
-        u = torch.autograd.grad(phi.sum(), xb)[0]
-        out.append(u.detach().cpu().numpy())
-    if was_training:
-        potential.train()
-    return np.concatenate(out, axis=0)
-
-
-# ODE-based utilities (forward push + reverse-time log p_t)
-
-def _drift_eval(potential: PotentialNet, x: torch.Tensor) -> torch.Tensor:
-    with torch.set_grad_enabled(True):
-        x_req = x.detach().requires_grad_(True)
-        phi = potential(x_req)
-        u = torch.autograd.grad(
-            phi.sum(), x_req, create_graph=False, retain_graph=False
-        )[0]
-    return u.detach()
-
-
-def _hutch_divergence(
-    potential: PotentialNet, x: torch.Tensor, n_probe: int = 1
-) -> torch.Tensor:
-    with torch.set_grad_enabled(True):
-        x_req = x.detach().requires_grad_(True)
-        phi = potential(x_req)
-        u = torch.autograd.grad(phi.sum(), x_req, create_graph=True, retain_graph=True)[
-            0
-        ]
-        out = 0.0
-        for k in range(n_probe):
-            v = torch.randn_like(x_req)
-            v = v / (v.norm(dim=1, keepdim=True) + 1e-12)
-            retain = k < n_probe - 1
-            vjp = torch.autograd.grad(
-                u, x_req, v, retain_graph=retain, create_graph=False
-            )[0]
-            out = out + (v * vjp).sum(dim=1, keepdim=True)
-    return out.detach() / float(n_probe)
-
-
-def rk4_forward_step(
-    potential: PotentialNet, x: torch.Tensor, dt: float
-) -> torch.Tensor:
-    k1 = _drift_eval(potential, x)
-    k2 = _drift_eval(potential, x + 0.5 * dt * k1)
-    k3 = _drift_eval(potential, x + 0.5 * dt * k2)
-    k4 = _drift_eval(potential, x + dt * k3)
-    return (x + (dt / 6.0) * (k1 + 2 * k2 + 2 * k3 + k4)).detach()
-
-
-def rk4_reverse_step(
-    potential: PotentialNet, x: torch.Tensor, ds: float
-) -> torch.Tensor:
-    k1 = -_drift_eval(potential, x)
-    k2 = -_drift_eval(potential, x + 0.5 * ds * k1)
-    k3 = -_drift_eval(potential, x + 0.5 * ds * k2)
-    k4 = -_drift_eval(potential, x + ds * k3)
-    return (x + (ds / 6.0) * (k1 + 2 * k2 + 2 * k3 + k4)).detach()
-
-
-def pushforward(
-    potential: PotentialNet, X0: torch.Tensor, t: float, steps: int = 80
-) -> torch.Tensor:
-    dt = float(t) / max(1, int(steps))
-    x = X0.detach()
-    for _ in range(max(1, int(steps))):
-        x = rk4_forward_step(potential, x, dt)
-    return x
-
-
-def pushforward_snapshots(
-    potential: PotentialNet, X0: torch.Tensor, T: float, K: int = 32
-):
-    """Uniform-grid forward snapshots at times {0, dt, 2dt, ..., T} with dt=T/K."""
-    K = int(K)
-    dt = float(T) / max(1, K)
-    x = X0.detach()
-    snaps = [x.detach().clone()]
-    for _ in range(1, K + 1):
-        x = rk4_forward_step(potential, x, dt)
-        snaps.append(x.detach().clone())
-    return snaps
-
-
-def logpt_reverse(
-    potential: PotentialNet,
-    logp0_fn,
-    X: torch.Tensor,
-    t: float,
-    steps: int = 80,
-    n_probe: int = 2,
-) -> torch.Tensor:
-    if t <= 0:
-        lp = logp0_fn(X)
-        return lp if lp.ndim == 2 else lp.view(-1, 1)
-    ds = float(t) / max(1, int(steps))
-    x = X.detach()
-    div_int = torch.zeros(X.size(0), 1, device=X.device)
-    for _ in range(max(1, int(steps))):
-        y1 = x
-        d1 = _hutch_divergence(potential, y1, n_probe)
-        k1 = -_drift_eval(potential, y1)
-        y2 = x + 0.5 * ds * k1
-        d2 = _hutch_divergence(potential, y2, n_probe)
-        k2 = -_drift_eval(potential, y2)
-        y3 = x + 0.5 * ds * k2
-        d3 = _hutch_divergence(potential, y3, n_probe)
-        k3 = -_drift_eval(potential, y3)
-        y4 = x + ds * k3
-        d4 = _hutch_divergence(potential, y4, n_probe)
-        k4 = -_drift_eval(potential, y4)
-        x = (x + (ds / 6.0) * (k1 + 2 * k2 + 2 * k3 + k4)).detach()
-        div_int = div_int + (ds / 6.0) * (d1 + 2 * d2 + 2 * d3 + d4)
-    lp0 = logp0_fn(x)
-    if lp0.ndim == 1:
-        lp0 = lp0.view(-1, 1)
-    return (lp0 - div_int).detach()
-
-
+# %%
 def roundtrip_error(
     potential: PotentialNet, X: torch.Tensor, t: float, steps: int = 80
 ) -> torch.Tensor:
@@ -179,6 +37,7 @@ def roundtrip_error(
 # =====================
 # Synthetic data generators
 # =====================
+
 
 def make_linear_translation_data(
     N0: int = 20000,
@@ -207,41 +66,8 @@ def make_linear_translation_data(
     return X0, X, v
 
 
-# ---- generic integrator + generator for arbitrary drift fields ----
-
-def rk4_step_u(u_fn, x: torch.Tensor, dt: float) -> torch.Tensor:
-    k1 = u_fn(x)
-    k2 = u_fn(x + 0.5 * dt * k1)
-    k3 = u_fn(x + 0.5 * dt * k2)
-    k4 = u_fn(x + dt * k3)
-    return x + (dt / 6.0) * (k1 + 2 * k2 + 2 * k3 + k4)
-
-
-def integrate_field(u_fn, x0: torch.Tensor, K: int, dt: float) -> torch.Tensor:
-    x = x0.detach()
-    for _ in range(int(K)):
-        x = rk4_step_u(u_fn, x, dt)
-    return x
-
-
-def generate_mixture_from_field(
-    u_fn, d: int, N0: int, N: int, T: float, K: int, sigma: float = 1.0, seed: int = 0
-):
-    rng = np.random.default_rng(seed)
-    X0 = rng.normal(0.0, sigma, size=(N0, d)).astype(np.float32)
-    Xstart = rng.normal(0.0, sigma, size=(N, d)).astype(np.float32)
-    k_idx = rng.integers(low=0, high=int(K) + 1, size=N, dtype=np.int64)
-    dt = float(T) / float(K)
-    dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    with torch.no_grad():
-        Xstart_t = torch.from_numpy(Xstart).float().to(dev)
-        X_t = integrate_field(u_fn, Xstart_t, K=int(K), dt=dt)
-        X = X_t.cpu().numpy()
-    ts = k_idx.astype(np.float32) * dt
-    return X0, X, ts
-
-
 # ---- Test 2: Linear drift u(x)=B x ----
+
 
 def make_linear_B_data(
     B: np.ndarray,
@@ -267,6 +93,7 @@ def make_linear_B_data(
 
 # helper constructors for B (2D blocks)
 
+
 def B_rotation_2d(omega: float) -> np.ndarray:
     return np.array([[0.0, -omega], [omega, 0.0]], dtype=np.float32)
 
@@ -284,6 +111,7 @@ def B_spiral_sink_2d(omega: float, rho: float) -> np.ndarray:
 
 
 # ---- Test 3: Nonlinear gradient flow (double-well) ----
+
 
 def make_double_well_data(
     d: int = 2,
@@ -314,6 +142,7 @@ def make_double_well_data(
 
 
 # ---- Test 4: Branching drift (Y-shaped) ----
+
 
 def make_branching_data(
     d: int = 2,
@@ -353,6 +182,7 @@ def make_branching_data(
 
 # ---- Test 5: Spiral dynamics embedded in R^d with nuisance dims ----
 
+
 def make_spiral_manifold_noise_data(
     d: int = 10,
     omega: float = 1.0,
@@ -381,7 +211,9 @@ def make_spiral_manifold_noise_data(
         u_fn, d=d, N0=N0, N=N, T=T, K=K, sigma=sigma0, seed=seed
     )
     return X0, X, ts, u_fn
-#%%
+
+
+# %%
 # --- choose which synthetic to run ---
 TEST_ID = 3  # 1: translation (baseline), 2: linear B, 3: double-well, 4: branching, 5: spiral+noise
 
@@ -454,7 +286,8 @@ elif TEST_ID == 5:
 else:
     raise ValueError("TEST_ID must be in {1,2,3,4,5}")
 
-#%%
+
+# %%
 # Standardization
 class ZScoreStandardizer:
     def __init__(self, eps: float = 1e-8):
@@ -485,33 +318,51 @@ class ZScoreStandardizer:
         sigma_t = torch.from_numpy(self.sigma.astype(np.float32)).to(device)
         return mu_t, sigma_t
 
+
 # Auto tuner (unchanged API, but uses trainer's EMA metrics)
 class AutoTuner:
-    def __init__(self,
-                 u2_band=(5.0, 25.0),
-                 g2_band=(1.0, 10.0),
-                 w_u_bounds=(1e-5, 1e-1),
-                 w_s_bounds=(1e-3, 1.0),
-                 gap_target=2.0):
+    def __init__(
+        self,
+        u2_band=(5.0, 25.0),
+        g2_band=(1.0, 10.0),
+        w_u_bounds=(1e-5, 1e-1),
+        w_s_bounds=(1e-3, 1.0),
+        gap_target=2.0,
+    ):
         self.u2_lo, self.u2_hi = u2_band
         self.g2_lo, self.g2_hi = g2_band
         self.wu_lo, self.wu_hi = w_u_bounds
         self.ws_lo, self.ws_hi = w_s_bounds
         self.gap_target = gap_target
-    def step(self, trainer: WeakFlowTrainer, gap_d_ma: float, U2_ma: float, G2_ma: float):
-        cfg = trainer.cfg; changed = {}
+
+    def step(
+        self, trainer: WeakFlowTrainer, gap_d_ma: float, U2_ma: float, G2_ma: float
+    ):
+        cfg = trainer.cfg
+        changed = {}
         if U2_ma > self.u2_hi:
-            cfg.drift_l2_weight = min(cfg.drift_l2_weight * 2.0, self.wu_hi); changed['drift_l2_weight'] = cfg.drift_l2_weight
+            cfg.drift_l2_weight = min(cfg.drift_l2_weight * 2.0, self.wu_hi)
+            changed["drift_l2_weight"] = cfg.drift_l2_weight
         elif U2_ma < self.u2_lo and gap_d_ma > self.gap_target:
-            cfg.drift_l2_weight = max(cfg.drift_l2_weight / 1.5, self.wu_lo); changed['drift_l2_weight'] = cfg.drift_l2_weight
+            cfg.drift_l2_weight = max(cfg.drift_l2_weight / 1.5, self.wu_lo)
+            changed["drift_l2_weight"] = cfg.drift_l2_weight
         if G2_ma > self.g2_hi:
-            cfg.sobolev_weight = min(cfg.sobolev_weight * 1.5, self.ws_hi); changed['sobolev_weight'] = cfg.sobolev_weight
-            cfg.diffusion_D = max(getattr(cfg, 'diffusion_D', 0.0), 1e-3); changed['diffusion_D'] = cfg.diffusion_D
+            cfg.sobolev_weight = min(cfg.sobolev_weight * 1.5, self.ws_hi)
+            changed["sobolev_weight"] = cfg.sobolev_weight
+            cfg.diffusion_D = max(getattr(cfg, "diffusion_D", 0.0), 1e-3)
+            changed["diffusion_D"] = cfg.diffusion_D
         elif G2_ma < self.g2_lo and gap_d_ma > self.gap_target:
-            cfg.sobolev_weight = max(cfg.sobolev_weight / 1.5, self.ws_lo); changed['sobolev_weight'] = cfg.sobolev_weight
-        if gap_d_ma < self.gap_target and (self.u2_lo <= U2_ma <= self.u2_hi) and (self.g2_lo <= G2_ma <= self.g2_hi):
-            cfg.T = min(cfg.T * 1.25, 4.0); changed['T'] = cfg.T
+            cfg.sobolev_weight = max(cfg.sobolev_weight / 1.5, self.ws_lo)
+            changed["sobolev_weight"] = cfg.sobolev_weight
+        if (
+            gap_d_ma < self.gap_target
+            and (self.u2_lo <= U2_ma <= self.u2_hi)
+            and (self.g2_lo <= G2_ma <= self.g2_hi)
+        ):
+            cfg.T = min(cfg.T * 1.25, 4.0)
+            changed["T"] = cfg.T
         return changed
+
 
 autotuner = AutoTuner()
 
@@ -519,11 +370,11 @@ autotuner = AutoTuner()
 standardizer = ZScoreStandardizer().fit(X0, X)
 X0 = standardizer.transform(X0)
 X = standardizer.transform(X)
-#%%
+# %%
 # --- trainer config ---
 cfg = Config(
     d=d,
-    T=.25,
+    T=0.25,
     order=1,
     steps=1500,
     batch_size=1024,
@@ -543,9 +394,9 @@ cfg = Config(
     diffusion_D=0.0,
     lap_probes=2,
 )
-#%%
+# %%
 trainer = WeakFlowTrainer(cfg, X0, X)
-#%%
+# %%
 # --- Training loop with cached metrics (no extra model evals) ---
 start = time.time()
 for step in range(1, cfg.steps + 1):
@@ -559,17 +410,19 @@ for step in range(1, cfg.steps + 1):
             x0b = torch.from_numpy(X0[:2048]).float().to(dev)
             Ep = trainer.critic(xb).mean().item()
             Ep0 = trainer.critic(x0b).mean().item()
-            updated_params = autotuner.step(trainer, trainer.gap_d_ma or gap_d, U2_ma, G2_ma)
+            updated_params = autotuner.step(
+                trainer, trainer.gap_d_ma or gap_d, U2_ma, G2_ma
+            )
         print(
             f"[{step:05d}] gap_c={gap_c:+.3e} gap_d={gap_d:+.3e} sob={sp:.2e} smooth={sm:.2e} "
             f"T_now={trainer.cfg.T:.2f} ord={trainer.cfg.order} Ep={Ep:+.2e} Ep0={Ep0:+.2e} u2_ma={U2_ma:.2e} g2_ma={G2_ma:.2e}"
         )
-        print(f'param updates: {updated_params}')
+        print(f"param updates: {updated_params}")
 end = time.time()
-print(f'Elapsed time: {end - start:.2f} seconds')
-#%%
+print(f"Elapsed time: {end - start:.2f} seconds")
+# %%
 potential, critic = trainer.potential.eval(), trainer.critic.eval()
-#%%
+# %%
 # --- Visualization ---
 X_all = np.vstack([X0, X])
 mean, comps = pca_fit(X_all, n=2)
@@ -578,7 +431,9 @@ Z = pca_project(X, mean, comps)
 # Simulation snapshots
 N_plot = min(4000, X0.shape[0])
 idx0_vis = np.random.choice(X0.shape[0], size=N_plot, replace=False)
-X0_vis_t = torch.from_numpy(X0[idx0_vis]).float().to(next(iter(potential.parameters())).device)
+X0_vis_t = (
+    torch.from_numpy(X0[idx0_vis]).float().to(next(iter(potential.parameters())).device)
+)
 K_snap = 20
 snaps = pushforward_snapshots(potential, X0_vis_t, T=T, K=K_snap)
 plt.figure(figsize=(6, 6))
@@ -586,14 +441,25 @@ colors = cm.viridis(np.linspace(0, 1, len(snaps)))
 for k, Yk in enumerate(snaps):
     Zk = pca_project(Yk.detach().cpu().numpy(), mean, comps)
     alpha = 0.12 if 0 < k < len(snaps) - 1 else 0.4
-    plt.scatter(Zk[:, 0], Zk[:, 1], s=5, color=colors[k], alpha=alpha,
-                label=(None if k not in (0, len(snaps) - 1) else ("t=0" if k == 0 else f"t={T}")))
+    plt.scatter(
+        Zk[:, 0],
+        Zk[:, 1],
+        s=5,
+        color=colors[k],
+        alpha=alpha,
+        label=(
+            None if k not in (0, len(snaps) - 1) else ("t=0" if k == 0 else f"t={T}")
+        ),
+    )
 idx_vis = np.random.choice(X.shape[0], size=N_plot, replace=False)
 Z_vis = pca_project(X[idx_vis], mean, comps)
 plt.scatter(Z_vis[:, 0], Z_vis[:, 1], s=5, color="grey", alpha=0.1, label="X (actual)")
 plt.title("Forward pushforward snapshots (PCA plane)")
-plt.xlabel("PC1"); plt.ylabel("PC2"); plt.tight_layout(); plt.show()
-#%%
+plt.xlabel("PC1")
+plt.ylabel("PC2")
+plt.tight_layout()
+plt.show()
+# %%
 # Vector field on PCA plane
 nq = 25
 marg = 0.00
@@ -623,33 +489,69 @@ idx0 = np.random.choice(Z0.shape[0], size=min(5000, Z0.shape[0]), replace=False)
 idx = np.random.choice(Z.shape[0], size=min(5000, Z.shape[0]), replace=False)
 plt.scatter(Z0[idx0, 0], Z0[idx0, 1], s=5, alpha=0.35, label="X0 (p0)")
 plt.scatter(Z[idx, 0], Z[idx, 1], s=5, alpha=0.35, label="X (mixture)")
-plt.quiver(G2[:, 0], G2[:, 1], U2[:, 0], U2[:, 1], angles="xy", scale_units="xy", scale=1, color="purple", label="u_hat")
+plt.quiver(
+    G2[:, 0],
+    G2[:, 1],
+    U2[:, 0],
+    U2[:, 1],
+    angles="xy",
+    scale_units="xy",
+    scale=1,
+    color="purple",
+    label="u_hat",
+)
 if Utrue2 is not None:
-    plt.quiver(G2[:, 0], G2[:, 1], Utrue2[:, 0], Utrue2[:, 1], angles="xy", scale_units="xy", scale=1, color="green", alpha=0.8, label="u_true")
-plt.legend(); plt.title("Projected drift field (PCA 2D) with X0 and X")
-plt.xlabel("PC1"); plt.ylabel("PC2"); plt.tight_layout(); plt.show()
-#%%
+    plt.quiver(
+        G2[:, 0],
+        G2[:, 1],
+        Utrue2[:, 0],
+        Utrue2[:, 1],
+        angles="xy",
+        scale_units="xy",
+        scale=1,
+        color="green",
+        alpha=0.8,
+        label="u_true",
+    )
+plt.legend()
+plt.title("Projected drift field (PCA 2D) with X0 and X")
+plt.xlabel("PC1")
+plt.ylabel("PC2")
+plt.tight_layout()
+plt.show()
+# %%
 # --- Field metrics if u_true_fn is available ---
 if u_true_fn is not None:
     dev = next(iter(potential.parameters())).device
-    pts = torch.from_numpy(X[np.random.choice(X.shape[0], size=5000, replace=False)]).float().to(dev)
+    pts = (
+        torch.from_numpy(X[np.random.choice(X.shape[0], size=5000, replace=False)])
+        .float()
+        .to(dev)
+    )
     u_hat = potential.drift(pts)
     u_true = u_true_fn(pts)
     mse = torch.mean((u_hat - u_true) ** 2).item()
-    cos = torch.mean(torch.sum(u_hat * u_true, dim=1) / (u_hat.norm(dim=1) * u_true.norm(dim=1) + 1e-8)).item()
+    cos = torch.mean(
+        torch.sum(u_hat * u_true, dim=1)
+        / (u_hat.norm(dim=1) * u_true.norm(dim=1) + 1e-8)
+    ).item()
     print(f"[metrics] MSE(u): {mse:.4e} | mean cos(u, u_true): {cos:.4f}")
-#%%
+# %%
 # --- t*(x) inference demo (valid for D=0) ---
-mu0_t = torch.from_numpy(X0.mean(0)).float().to(next(iter(potential.parameters())).device)
+mu0_t = (
+    torch.from_numpy(X0.mean(0)).float().to(next(iter(potential.parameters())).device)
+)
 X0_t = torch.from_numpy(X0).float().to(mu0_t.device)
 cov0_t = torch.cov(X0_t.T) + 1e-6 * torch.eye(X0_t.size(1), device=mu0_t.device)
 L0 = torch.linalg.cholesky(cov0_t)
 inv_cov0 = torch.cholesky_inverse(L0)
-const0 = (-0.5 * X0_t.size(1) * math.log(2 * math.pi) - torch.log(torch.diag(L0)).sum())
+const0 = -0.5 * X0_t.size(1) * math.log(2 * math.pi) - torch.log(torch.diag(L0)).sum()
+
 
 def logp0_gaussian(x: torch.Tensor) -> torch.Tensor:
     xc = x - mu0_t
     return const0 - 0.5 * (xc * (xc @ inv_cov0)).sum(dim=1, keepdim=True)
+
 
 @torch.no_grad()
 def argmax_t_for_batch(
@@ -663,7 +565,9 @@ def argmax_t_for_batch(
     K = int(K)
     ts = torch.linspace(0.0, float(T), steps=K + 1, device=X_t.device)
     vals = [
-        logpt_reverse(potential, logp0_fn, X_t, float(tval.item()), steps=K, n_probe=n_probe)
+        logpt_reverse(
+            potential, logp0_fn, X_t, float(tval.item()), steps=K, n_probe=n_probe
+        )
         for tval in ts
     ]
     L = torch.cat(vals, dim=1)
@@ -671,6 +575,7 @@ def argmax_t_for_batch(
     t_star = ts[idx].unsqueeze(1)
     logp_star = L.gather(1, idx.unsqueeze(1))
     return t_star, logp_star, ts, L
+
 
 K_GEN = 64
 B_eval = min(8000, X.shape[0])
@@ -682,15 +587,23 @@ _t_star, _logp_star, ts_grid, Lgrid = argmax_t_for_batch(
 t_star_np = _t_star.squeeze(1).cpu().numpy()
 plt.figure(figsize=(6, 4))
 plt.hist(t_star_np, bins=30, density=True, alpha=0.8)
-plt.xlabel(r"$t^*(x)$"); plt.ylabel("density")
+plt.xlabel(r"$t^*(x)$")
+plt.ylabel("density")
 plt.title("Inferred latent times $t^*(x)$ for a subset of X")
-plt.tight_layout(); plt.show()
-#%%
+plt.tight_layout()
+plt.show()
+# %%
 Z_eval = pca_project(X[idx_eval], mean, comps)
 plt.figure(figsize=(6, 6))
-sc = plt.scatter(Z_eval[:, 0], Z_eval[:, 1], c=t_star_np, s=8, cmap="viridis", alpha=0.8)
-cb = plt.colorbar(sc); cb.set_label(r"$t^*(x)$")
+sc = plt.scatter(
+    Z_eval[:, 0], Z_eval[:, 1], c=t_star_np, s=8, cmap="viridis", alpha=0.8
+)
+cb = plt.colorbar(sc)
+cb.set_label(r"$t^*(x)$")
 plt.title("PCA of X colored by inferred $t^*(x)$")
-plt.xlabel("PC1"); plt.ylabel("PC2"); plt.tight_layout(); plt.show()
+plt.xlabel("PC1")
+plt.ylabel("PC2")
+plt.tight_layout()
+plt.show()
 
 # %%

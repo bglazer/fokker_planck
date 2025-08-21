@@ -14,6 +14,7 @@ from torch.utils.data import TensorDataset, DataLoader
 # Utilities
 # =====================
 
+
 def set_requires_grad(module: nn.Module, flag: bool) -> None:
     for p in module.parameters():
         p.requires_grad_(flag)
@@ -94,22 +95,27 @@ class CriticNet(nn.Module):
 # Weak-operator building blocks (optimized)
 # =====================
 
+
 def _precompute_local(critic: CriticNet, potential: PotentialNet, x: torch.Tensor):
     """Compute f, ∇f, and u once from x (keeps graph for higher-order ops)."""
     x_req = x.requires_grad_(True)
-    f = critic(x_req)                 # (B,1)
+    f = critic(x_req)  # (B,1)
     grad_f = grad_scalar_output(f, x_req)  # (B,d)
-    u = potential.drift(x_req)        # (B,d)
+    u = potential.drift(x_req)  # (B,d)
     return x_req, f, grad_f, u
 
 
-def _laplacian_hutch_from_grad(grad_f: torch.Tensor, x: torch.Tensor, m: int = 2) -> torch.Tensor:
+def _laplacian_hutch_from_grad(
+    grad_f: torch.Tensor, x: torch.Tensor, m: int = 2
+) -> torch.Tensor:
     """Hutchinson estimator of Δf using precomputed ∇f. Returns (B,1)."""
     lap = 0.0
     for k in range(m):
         v = torch.randn_like(x)
         v = v / (v.norm(dim=1, keepdim=True) + 1e-12)
-        Hv = torch.autograd.grad((grad_f * v).sum(), x, retain_graph=(k < m - 1), create_graph=True)[0]
+        Hv = torch.autograd.grad(
+            (grad_f * v).sum(), x, retain_graph=(k < m - 1), create_graph=True
+        )[0]
         lap = lap + (Hv * v).sum(dim=1, keepdim=True)
     return lap / float(m)
 
@@ -169,7 +175,10 @@ def RT_apply_with_diffusion(
 # Penalties (return metrics for free)
 # =====================
 
-def sobolev_penalty_and_g2(critic: CriticNet, x: torch.Tensor, weight: float) -> Tuple[torch.Tensor, torch.Tensor]:
+
+def sobolev_penalty_and_g2(
+    critic: CriticNet, x: torch.Tensor, weight: float
+) -> Tuple[torch.Tensor, torch.Tensor]:
     if weight <= 0.0:
         z = torch.zeros((), device=x.device)
         return z, z
@@ -180,7 +189,9 @@ def sobolev_penalty_and_g2(critic: CriticNet, x: torch.Tensor, weight: float) ->
     return weight * g2, g2.detach()
 
 
-def drift_l2_penalty_and_u2(potential: PotentialNet, x: torch.Tensor, weight: float) -> Tuple[torch.Tensor, torch.Tensor]:
+def drift_l2_penalty_and_u2(
+    potential: PotentialNet, x: torch.Tensor, weight: float
+) -> Tuple[torch.Tensor, torch.Tensor]:
     if weight <= 0.0:
         z = torch.zeros((), device=x.device)
         return z, z
@@ -235,10 +246,14 @@ class WeakFlowTrainer:
             batch_size=cfg.batch_size,
             shuffle=True,
             drop_last=True,
-            pin_memory=(self.device.type == 'cuda'),
+            pin_memory=(self.device.type == "cuda"),
         )
         self.loader = DataLoader(
-            ds, batch_size=cfg.batch_size, shuffle=True, drop_last=True, pin_memory=(self.device.type == 'cuda')
+            ds,
+            batch_size=cfg.batch_size,
+            shuffle=True,
+            drop_last=True,
+            pin_memory=(self.device.type == "cuda"),
         )
         self.it0 = iter(self.loader0)
         self.it = iter(self.loader)
@@ -284,7 +299,9 @@ class WeakFlowTrainer:
         set_requires_grad(self.critic, True)
         x, self.it = self._next_batch(self.it, self.loader)  # from p
         x0, self.it0 = self._next_batch(self.it0, self.loader0)  # from p0
-        with torch.amp.autocast(enabled=cfg.mixed_precision, device_type=self.device.type):
+        with torch.amp.autocast(
+            enabled=cfg.mixed_precision, device_type=self.device.type
+        ):
             f_p = self.critic(x).mean()
             rt = RT_apply_with_diffusion(
                 self.critic,
@@ -316,7 +333,9 @@ class WeakFlowTrainer:
         set_requires_grad(self.potential, True)
         x, self.it = self._next_batch(self.it, self.loader)
         x0, self.it0 = self._next_batch(self.it0, self.loader0)
-        with torch.amp.autocast(enabled=cfg.mixed_precision, device_type=self.device.type):
+        with torch.amp.autocast(
+            enabled=cfg.mixed_precision, device_type=self.device.type
+        ):
             f_p = self.critic(x).mean().detach()  # do not backprop through critic
             rt = RT_apply_with_diffusion(
                 self.critic,
@@ -329,7 +348,9 @@ class WeakFlowTrainer:
             ).mean()
             gap = f_p - rt
             sm_x, u2_x = drift_l2_penalty_and_u2(self.potential, x, cfg.drift_l2_weight)
-            sm_x0, u2_x0 = drift_l2_penalty_and_u2(self.potential, x0, cfg.drift_l2_weight)
+            sm_x0, u2_x0 = drift_l2_penalty_and_u2(
+                self.potential, x0, cfg.drift_l2_weight
+            )
             sm = 0.5 * sm_x + 0.5 * sm_x0
             u2 = 0.5 * u2_x + 0.5 * u2_x0
             loss = gap + sm
@@ -354,4 +375,3 @@ class WeakFlowTrainer:
                     f"u2_ma={self.u2_ma:.3e} g2_ma={self.g2_ma:.3e} loss_d={loss_d:+.4e}"
                 )
         print("Training done.")
-
