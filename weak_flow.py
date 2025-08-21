@@ -1,6 +1,6 @@
 # weakflow.py
 # Neural weak-form learning of a drift field u(x)=∇phi(x) from (p0, p) with uniform time-mixture on [0,T].
-# No ODE solves; uses only local derivatives (directional derivatives) of a neural critic.
+# Optimized + consolidated: avoids redundant forward/grad evals, caches metrics during steps.
 
 from dataclasses import dataclass
 from typing import Optional, Tuple, List
@@ -8,13 +8,11 @@ import math
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.utils.data import TensorDataset, DataLoader
 
 # =====================
 # Utilities
 # =====================
-
 
 def set_requires_grad(module: nn.Module, flag: bool) -> None:
     for p in module.parameters():
@@ -93,56 +91,31 @@ class CriticNet(nn.Module):
 
 
 # =====================
-# Weak-operator building blocks
+# Weak-operator building blocks (optimized)
 # =====================
 
-
-def laplacian_hutch(critic: CriticNet, x: torch.Tensor, m: int = 2) -> torch.Tensor:
-    """Hutchinson estimator of Δf(x)=tr(∇²f). Uses Hessian–vector products only.
-    Returns (B,1)."""
+def _precompute_local(critic: CriticNet, potential: PotentialNet, x: torch.Tensor):
+    """Compute f, ∇f, and u once from x (keeps graph for higher-order ops)."""
     x_req = x.requires_grad_(True)
-    f = critic(x_req)
-    g = grad_scalar_output(f, x_req)  # ∇f
+    f = critic(x_req)                 # (B,1)
+    grad_f = grad_scalar_output(f, x_req)  # (B,d)
+    u = potential.drift(x_req)        # (B,d)
+    return x_req, f, grad_f, u
+
+
+def _laplacian_hutch_from_grad(grad_f: torch.Tensor, x: torch.Tensor, m: int = 2) -> torch.Tensor:
+    """Hutchinson estimator of Δf using precomputed ∇f. Returns (B,1)."""
     lap = 0.0
     for k in range(m):
-        v = torch.randn_like(x_req)
+        v = torch.randn_like(x)
         v = v / (v.norm(dim=1, keepdim=True) + 1e-12)
-        Hv = torch.autograd.grad((g * v).sum(), x_req, retain_graph=(k < m - 1))[0]
-        lap = lap + (Hv * v).sum(dim=1, keepdim=True)  # vᵀH v
+        Hv = torch.autograd.grad((grad_f * v).sum(), x, retain_graph=(k < m - 1), create_graph=True)[0]
+        lap = lap + (Hv * v).sum(dim=1, keepdim=True)
     return lap / float(m)
 
 
-def L_f(critic: CriticNet, potential: PotentialNet, x: torch.Tensor) -> torch.Tensor:
-    """(L f)(x) = u·∇f with respect to x; parameters may be frozen by caller."""
-    x_req = x.requires_grad_(True)
-    u = potential.drift(x_req)
-    f = critic(x_req)
-    grad_f = grad_scalar_output(f, x_req)
+def _L1_from_parts(grad_f: torch.Tensor, u: torch.Tensor) -> torch.Tensor:
     return (u * grad_f).sum(dim=1, keepdim=True)
-
-
-def L_f_with_diffusion(
-    critic: CriticNet,
-    potential: PotentialNet,
-    x: torch.Tensor,
-    D_scalar: float,
-    lap_probes: int = 2,
-) -> torch.Tensor:
-    """(L f)(x) with optional isotropic diffusion: u·∇f + D Δf."""
-    drift_term = L_f(critic, potential, x)
-    if D_scalar is None or D_scalar <= 0.0:
-        return drift_term
-    diff_term = D_scalar * laplacian_hutch(critic, x, m=max(1, int(lap_probes)))
-    return drift_term + diff_term
-
-
-def L2_f(critic: CriticNet, potential: PotentialNet, x: torch.Tensor) -> torch.Tensor:
-    """(L^2 f)(x) = (u·∇)(u·∇f)."""
-    x_req = x.requires_grad_(True)
-    L1 = L_f(critic, potential, x_req)
-    grad_L1 = grad_scalar_output(L1, x_req)
-    u = potential.drift(x_req)
-    return (u * grad_L1).sum(dim=1, keepdim=True)
 
 
 def RT_apply(
@@ -152,13 +125,17 @@ def RT_apply(
     T: float,
     order: int = 1,
 ) -> torch.Tensor:
-    """R_T f ≈ f + (T/2)Lf + (T^2/6)L^2 f."""
-    f = critic(x0)
+    """R_T f ≈ f + (T/2)Lf + (T^2/6)L^2 f (no diffusion). Optimized: single critic forward."""
+    x_req, f0, grad_f, u = _precompute_local(critic, potential, x0)
+    out = f0
     if order >= 1:
-        f = f + 0.5 * T * L_f(critic, potential, x0)
+        L1 = _L1_from_parts(grad_f, u)
+        out = out + 0.5 * T * L1
     if order >= 2:
-        f = f + (T**2 / 6.0) * L2_f(critic, potential, x0)
-    return f
+        grad_L1 = grad_scalar_output(L1, x_req)
+        L2 = _L1_from_parts(grad_L1, u)
+        out = out + (T**2 / 6.0) * L2
+    return out
 
 
 def RT_apply_with_diffusion(
@@ -170,40 +147,46 @@ def RT_apply_with_diffusion(
     D_scalar: float = 0.0,
     lap_probes: int = 2,
 ) -> torch.Tensor:
-    """Same as RT_apply but includes isotropic diffusion term D Δf in 𝓛.
-    For stability we apply order-1 when D>0; when D==0 we honor the requested order."""
-    f = critic(x0)
-    if order >= 1:
-        L1 = L_f_with_diffusion(
-            critic, potential, x0, D_scalar=D_scalar, lap_probes=lap_probes
-        )
-        f = f + 0.5 * T * L1
-    if (order >= 2) and (D_scalar <= 0.0):
-        f = f + (T**2 / 6.0) * L2_f(critic, potential, x0)
-    return f
+    """R_T with optional isotropic diffusion term D Δf in 𝓛.
+    For stability we keep order-1 when D>0."""
+    x_req, f0, grad_f, u = _precompute_local(critic, potential, x0)
+    L1 = _L1_from_parts(grad_f, u)
+    if D_scalar is not None and D_scalar > 0.0:
+        lap = _laplacian_hutch_from_grad(grad_f, x_req, m=max(1, int(lap_probes)))
+        L1 = L1 + D_scalar * lap
+        # order forced to 1 when diffusion present (as in original code)
+        return f0 + 0.5 * T * L1
+    # D==0: honor requested order
+    out = f0 + 0.5 * T * L1
+    if order >= 2:
+        grad_L1 = grad_scalar_output(L1, x_req)
+        L2 = _L1_from_parts(grad_L1, u)
+        out = out + (T**2 / 6.0) * L2
+    return out
 
 
 # =====================
-# Penalties
+# Penalties (return metrics for free)
 # =====================
 
-
-def sobolev_penalty(critic: CriticNet, x: torch.Tensor, weight: float) -> torch.Tensor:
+def sobolev_penalty_and_g2(critic: CriticNet, x: torch.Tensor, weight: float) -> Tuple[torch.Tensor, torch.Tensor]:
     if weight <= 0.0:
-        return torch.zeros((), device=x.device)
+        z = torch.zeros((), device=x.device)
+        return z, z
     x_req = x.requires_grad_(True)
     f = critic(x_req)
     gradf = grad_scalar_output(f, x_req)
-    return weight * (gradf.pow(2).sum(dim=1).mean())
+    g2 = gradf.pow(2).sum(dim=1).mean()
+    return weight * g2, g2.detach()
 
 
-def drift_l2_penalty(
-    potential: PotentialNet, x: torch.Tensor, weight: float
-) -> torch.Tensor:
+def drift_l2_penalty_and_u2(potential: PotentialNet, x: torch.Tensor, weight: float) -> Tuple[torch.Tensor, torch.Tensor]:
     if weight <= 0.0:
-        return torch.zeros((), device=x.device)
+        z = torch.zeros((), device=x.device)
+        return z, z
     u = potential.drift(x)
-    return weight * (u.pow(2).sum(dim=1).mean())
+    u2 = u.pow(2).sum(dim=1).mean()
+    return weight * u2, u2.detach()
 
 
 # =====================
@@ -229,7 +212,6 @@ class Config:
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     mixed_precision: bool = False
     log_every: int = 50
-    # new: optional diffusion
     diffusion_D: float = 0.0
     lap_probes: int = 2
 
@@ -253,10 +235,10 @@ class WeakFlowTrainer:
             batch_size=cfg.batch_size,
             shuffle=True,
             drop_last=True,
-            pin_memory=True,
+            pin_memory=(self.device.type == 'cuda'),
         )
         self.loader = DataLoader(
-            ds, batch_size=cfg.batch_size, shuffle=True, drop_last=True, pin_memory=True
+            ds, batch_size=cfg.batch_size, shuffle=True, drop_last=True, pin_memory=(self.device.type == 'cuda')
         )
         self.it0 = iter(self.loader0)
         self.it = iter(self.loader)
@@ -278,6 +260,14 @@ class WeakFlowTrainer:
             self.potential.parameters(), lr=cfg.lr_potential, betas=(0.5, 0.9)
         )
         self.scaler = torch.amp.GradScaler(enabled=cfg.mixed_precision)
+        # metrics ema
+        self.u2_ma: Optional[float] = None
+        self.g2_ma: Optional[float] = None
+        self.gap_d_ma: Optional[float] = None
+        self.ema_decay = 0.9
+
+    def _ema_update(self, old: Optional[float], val: float) -> float:
+        return val if old is None else self.ema_decay * old + (1 - self.ema_decay) * val
 
     def _next_batch(self, it, loader):
         try:
@@ -287,15 +277,14 @@ class WeakFlowTrainer:
             (x,) = next(it)
         return x.to(self.device, non_blocking=True), it
 
-    def critic_step(self) -> Tuple[float, float]:
+    def critic_step(self) -> Tuple[float, float, float]:
+        """Returns: gap_c, sobolev_penalty, G2 (mean ||∇f||^2)."""
         cfg = self.cfg
         set_requires_grad(self.potential, False)
         set_requires_grad(self.critic, True)
         x, self.it = self._next_batch(self.it, self.loader)  # from p
         x0, self.it0 = self._next_batch(self.it0, self.loader0)  # from p0
-        with torch.amp.autocast(
-            enabled=cfg.mixed_precision, device_type=self.device.type
-        ):
+        with torch.amp.autocast(enabled=cfg.mixed_precision, device_type=self.device.type):
             f_p = self.critic(x).mean()
             rt = RT_apply_with_diffusion(
                 self.critic,
@@ -307,26 +296,28 @@ class WeakFlowTrainer:
                 lap_probes=cfg.lap_probes,
             ).mean()
             gap = f_p - rt
-            sp = 0.5 * sobolev_penalty(
-                self.critic, x, cfg.sobolev_weight
-            ) + 0.5 * sobolev_penalty(self.critic, x0, cfg.sobolev_weight)
+            sp_x, g2_x = sobolev_penalty_and_g2(self.critic, x, cfg.sobolev_weight)
+            sp_x0, g2_x0 = sobolev_penalty_and_g2(self.critic, x0, cfg.sobolev_weight)
+            sp = 0.5 * sp_x + 0.5 * sp_x0
+            g2 = 0.5 * g2_x + 0.5 * g2_x0
             loss = -(gap) + sp
         self.opt_c.zero_grad(set_to_none=True)
         self.scaler.scale(loss).backward()
         self.scaler.step(self.opt_c)
         self.scaler.update()
-        return gap.item(), sp.item()
+        # update ema metric
+        self.g2_ma = float(self._ema_update(self.g2_ma, g2.item()))
+        return gap.item(), sp.item(), self.g2_ma
 
-    def drift_step(self) -> Tuple[float, float, float]:
+    def drift_step(self) -> Tuple[float, float, float, float]:
+        """Returns: gap_d, smooth_penalty, loss_d, U2 (ema)."""
         cfg = self.cfg
         set_requires_grad(self.critic, False)
         set_requires_grad(self.potential, True)
         x, self.it = self._next_batch(self.it, self.loader)
         x0, self.it0 = self._next_batch(self.it0, self.loader0)
-        with torch.amp.autocast(
-            enabled=cfg.mixed_precision, device_type=self.device.type
-        ):
-            f_p = self.critic(x).mean().detach()
+        with torch.amp.autocast(enabled=cfg.mixed_precision, device_type=self.device.type):
+            f_p = self.critic(x).mean().detach()  # do not backprop through critic
             rt = RT_apply_with_diffusion(
                 self.critic,
                 self.potential,
@@ -337,24 +328,30 @@ class WeakFlowTrainer:
                 lap_probes=cfg.lap_probes,
             ).mean()
             gap = f_p - rt
-            sm = 0.5 * drift_l2_penalty(
-                self.potential, x, cfg.drift_l2_weight
-            ) + 0.5 * drift_l2_penalty(self.potential, x0, cfg.drift_l2_weight)
+            sm_x, u2_x = drift_l2_penalty_and_u2(self.potential, x, cfg.drift_l2_weight)
+            sm_x0, u2_x0 = drift_l2_penalty_and_u2(self.potential, x0, cfg.drift_l2_weight)
+            sm = 0.5 * sm_x + 0.5 * sm_x0
+            u2 = 0.5 * u2_x + 0.5 * u2_x0
             loss = gap + sm
         self.opt_p.zero_grad(set_to_none=True)
         self.scaler.scale(loss).backward()
         self.scaler.step(self.opt_p)
         self.scaler.update()
-        return gap.item(), sm.item(), loss.item()
+        # ema updates
+        self.u2_ma = float(self._ema_update(self.u2_ma, u2.item()))
+        self.gap_d_ma = float(self._ema_update(self.gap_d_ma, gap.item()))
+        return gap.item(), sm.item(), loss.item(), self.u2_ma
 
     def train(self) -> None:
         cfg = self.cfg
         for step in range(1, cfg.steps + 1):
             for _ in range(cfg.n_critic):
-                gap_c, sp = self.critic_step()
-            gap_d, sm, loss_d = self.drift_step()
+                gap_c, sp, g2 = self.critic_step()
+            gap_d, sm, loss_d, u2 = self.drift_step()
             if step % cfg.log_every == 0:
                 print(
-                    f"[{step:06d}] gap_c={gap_c:+.4e} gap_d={gap_d:+.4e} sob={sp:.3e} smooth={sm:.3e} loss_d={loss_d:+.4e}"
+                    f"[{step:06d}] gap_c={gap_c:+.4e} gap_d={gap_d:+.4e} sob={sp:.3e} smooth={sm:.3e} "
+                    f"u2_ma={self.u2_ma:.3e} g2_ma={self.g2_ma:.3e} loss_d={loss_d:+.4e}"
                 )
         print("Training done.")
+
