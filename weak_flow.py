@@ -131,7 +131,7 @@ def RT_apply(
     T: float,
     order: int = 1,
 ) -> torch.Tensor:
-    """R_T f ≈ f + (T/2)Lf + (T^2/6)L^2 f (no diffusion). Optimized: single critic forward."""
+    """R_T f ≈ f + (T/2)Lf + (T^2/6)L^2 f (no d iffusion). Optimized: single critic forward."""
     x_req, f0, grad_f, u = _precompute_local(critic, potential, x0)
     out = f0
     if order >= 1:

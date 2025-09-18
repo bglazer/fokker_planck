@@ -159,7 +159,9 @@ sc.pl.umap(adata, color=["weakflow_X0"], wspace=0.5, s=3)
 # We’ll use the first 50 PCs as coordinates (d = 50). You can try HVG counts as well,
 # but PCs are a strong, denoised Euclidean representation that many trajectory tools use.
 Z = adata.obsm["X_pca"].astype(np.float32)  # (cells, 50)
+Z_ = Z[~X0_mask, :]
 Z0 = Z[X0_mask, :]
+Z = Z_
 d = Z.shape[1]
 
 # Z-score standardization (no whitening)
@@ -168,19 +170,14 @@ std = Z.std(axis=0, keepdims=True).astype(np.float32) + 1e-6
 Z_std = (Z - mu) / std
 
 # Partition: X0 = progenitor pool; X = whole snapshot (mixture over latent times)
-X0_np = Z_std[X0_mask, :]
-X_np = Z_std
+# X0_np = Z_std[X0_mask, :]
+# X_np = Z_std
 
-print("Shapes | X0:", X0_np.shape, " X:", X_np.shape)
+# print("Shapes | X0:", X0_np.shape, " X:", X_np.shape)
 
 # %%
 # === 4) Train Weakflow on (X0, X) ===
 # Choose a conservative horizon T and order=1 to keep the weak surrogate stable.
-T = 2.0  # "time window" of the mixture (tune; start small)
-order = 1
-steps = 4000
-batch_size = 1024
-
 from weak_flow_util import ZScoreStandardizer, AutoTuner
 
 autotuner = AutoTuner(
@@ -200,17 +197,17 @@ X = standardizer.transform(Z)
 # --- trainer config ---
 cfg = Config(
     d=d,
-    T=0.25,
+    T=.3,
     order=1,
     steps=500,
     batch_size=512,
     n_critic=1,
-    lr_potential=1e-4,
+    lr_potential=5e-4,
     lr_critic=1e-4,
-    sobolev_weight=0.2,
-    drift_l2_weight=.008,
-    critic_width=128,
-    critic_depth=3,
+    sobolev_weight=.2,
+    drift_l2_weight=1e-3,
+    critic_width=32,
+    critic_depth=2,
     spectral_norm_critic=True,
     potential_width=256,
     potential_depth=4,
@@ -225,7 +222,7 @@ trainer = WeakFlowTrainer(cfg, X0, X)
 # %%
 # Training
 start = time.time()
-cfg.steps = 1500
+cfg.steps = 500
 
 for step in range(1, cfg.steps + 1):
     gap_c, sp, G2_ma = trainer.critic_step()
@@ -248,7 +245,7 @@ for step in range(1, cfg.steps + 1):
         print(f"param updates: {updated_params}")
 end = time.time()
 print(f"Elapsed time: {end - start:.2f} seconds")
-# %%
+ # %%
 potential, critic = trainer.potential.eval(), trainer.critic.eval()
 # %%
 # === 5) Visualize the learned drift on the PCA plane ===
@@ -257,8 +254,9 @@ potential, critic = trainer.potential.eval(), trainer.critic.eval()
 
 # Recompute PCA fit only to get a convenience projector (identity on the first 2 PCs in this case).
 # If you later switch features (e.g., HVGs), these helpers still work.
-mean_2d, comps_2d = pca_fit(Z_np := Z, n=2)
+mean_2d, comps_2d = pca_fit(Z, n=2)
 Z2 = pca_project(Z, mean_2d, comps_2d)
+Z02 = pca_project(Z0, mean_2d, comps_2d)
 Z2_all = Z2
 
 nq = 35
@@ -281,10 +279,10 @@ U_full = drift_batch(potential, G_full_std)  # (nq^2, 50)
 U2 = U_full @ comps_2d.T
 U2 = U2 / (np.linalg.norm(U2, axis=1, keepdims=True) + 1e-8) * 0.25  # scale arrows
 
-plt.figure(figsize=(6, 6))
+plt.figure(figsize=(10, 10))
 idx = np.random.choice(Z2.shape[0], size=min(6000, Z2.shape[0]), replace=False)
 plt.scatter(Z2[idx, 0], Z2[idx, 1], s=4, alpha=0.25, label="all cells")
-plt.scatter(Z2[X0_mask, 0], Z2[X0_mask, 1], s=6, alpha=0.6, label="X0 (stem/prog)")
+plt.scatter(Z02[:, 0], Z02[:, 1], s=6, alpha=0.6, label="X0 (stem/prog)")
 plt.quiver(
     G2[:, 0], G2[:, 1], U2[:, 0], U2[:, 1], angles="xy", scale_units="xy", scale=1
 )
@@ -299,8 +297,8 @@ plt.show()
 # --- Forward simulation and overlay on observed data (PC1–PC2 plane) ---
 
 # Use current (possibly autotuned) horizon
-T_sim = float(trainer.cfg.T)
-K_snap = 20  # number of snapshot slices (inclusive of t=0 and t=T_sim)
+T_sim = 1
+K_snap = 50  # number of snapshot slices (inclusive of t=0 and t=T_sim)
 N_seed = min(4000, X0.shape[0])
 device = next(potential.parameters()).device
 
@@ -347,63 +345,3 @@ plt.legend(frameon=False)
 plt.tight_layout()
 plt.show()
 
-# %%
-# === 6) Infer t*(x) = argmax_t log p_t(x) using reverse solve (no ODE backprop) ===
-# We need log p0(x) in model space. Use a Gaussian fit on X0 (standardized PCA features).
-X0_t = torch.from_numpy(X0_np).float().to(next(iter(potential.parameters())).device)
-mu0_t = X0_t.mean(0, keepdim=True)
-cov0_t = torch.cov(X0_t.T) + 1e-6 * torch.eye(X0_t.size(1), device=X0_t.device)
-L0 = torch.linalg.cholesky(cov0_t)
-inv_cov0 = torch.cholesky_inverse(L0)
-const0 = -0.5 * X0_t.size(1) * np.log(2 * np.pi) - torch.log(torch.diag(L0)).sum()
-
-
-def logp0_gaussian(x: torch.Tensor) -> torch.Tensor:
-    xc = x - mu0_t
-    return const0 - 0.5 * (xc * (xc @ inv_cov0)).sum(dim=1, keepdim=True)
-
-
-# Grid-evaluate log p_t(x) for a subset of cells and take argmax
-K_grid = 64
-X_eval = (
-    torch.from_numpy(
-        X_np[
-            np.random.choice(
-                X_np.shape[0], size=min(8000, X_np.shape[0]), replace=False
-            )
-        ]
-    )
-    .float()
-    .to(X0_t.device)
-)
-
-ts = torch.linspace(0.0, float(T), steps=K_grid + 1, device=X_eval.device)
-vals = []
-for tval in ts:
-    vals.append(
-        logpt_reverse(
-            potential,
-            logp0_gaussian,
-            X_eval,
-            float(tval.item()),
-            steps=K_grid,
-            n_probe=2,
-        )
-    )
-Lgrid = torch.cat(vals, dim=1)  # (B, K_grid+1)
-idx_max = torch.argmax(Lgrid, dim=1)
-t_star = ts[idx_max].detach().cpu().numpy()
-
-# Visualize t*(x) on PC1–PC2
-Z_eval2 = Z2[np.random.choice(Z2.shape[0], size=t_star.shape[0], replace=False)]
-plt.figure(figsize=(6, 6))
-scat = plt.scatter(
-    Z_eval2[:, 0], Z_eval2[:, 1], c=t_star, s=8, cmap="viridis", alpha=0.85
-)
-cb = plt.colorbar(scat)
-cb.set_label(r"$t^*(x)$")
-plt.title(r"Inferred $t^*(x)$ on DG (PC1–PC2)")
-plt.xlabel("PC1")
-plt.ylabel("PC2")
-plt.tight_layout()
-plt.show()
